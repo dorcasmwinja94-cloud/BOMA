@@ -1,0 +1,266 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  MANAGER
+  RESERVATION_OFFICER
+  CLIENT
+}
+
+enum ServiceType {
+  ACCOMMODATION
+  TOUR
+  TRANSPORT
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  FLAGGED_DUPLICATE
+}
+
+enum SyncStatus {
+  SYNCED
+  PENDING_RETRY
+  FAILED
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model User {
+  id                  String           @id @default(uuid())
+  fullName            String
+  email               String           @unique
+  passwordHash        String
+  role                Role
+  isActive            Boolean          @default(true)
+  failedLoginAttempts Int              @default(0)
+  lockedUntil         DateTime?
+  passwordResetToken  String?
+  passwordResetExpires DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  client              Client?
+  createdReservations Reservation[]
+  auditLogs           AuditLog[]
+  generatedReports    Report[]
+  notifications       Notification[]
+}
+
+model Client {
+  id          String         @id @default(uuid())
+  userId      String?        @unique
+  fullName    String
+  email       String
+  phoneNumber String
+  address     String?
+  isGuest     Boolean        @default(false)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  user        User?          @relation(fields: [userId], references: [id])
+  reservations Reservation[]
+  guestPreferences GuestPreference[]
+  notifications Notification[]
+}
+
+model Service {
+  id           String        @id @default(uuid())
+  name         String
+  serviceType  ServiceType
+  location     String
+  capacity     Int
+  pricePerUnit Float
+  description  String?
+  isActive     Boolean       @default(true)
+  imageUrl     String?
+  images       String[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  reservations Reservation[]
+  pricingRules PricingRule[]
+  serviceRules ServiceRule[]
+}
+
+model Reservation {
+  id            String            @id @default(uuid())
+  clientId      String
+  serviceId     String
+  createdById   String
+  checkInDate   DateTime
+  checkOutDate  DateTime
+  numberOfGuests Int
+  totalAmount    Float
+  status         ReservationStatus @default(PENDING)
+  syncStatus     SyncStatus        @default(PENDING_RETRY)
+  version        Int               @default(1)
+  notes          String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  client         Client            @relation(fields: [clientId], references: [id])
+  service        Service           @relation(fields: [serviceId], references: [id])
+  createdBy      User              @relation(fields: [createdById], references: [id])
+  confirmation   Confirmation?
+  syncLogs       SyncLog[]
+  payments       Payment[]
+  assignments    Assignment[]
+  waivers        Waiver[]
+  notifications  Notification[]
+  paymentIntents PaymentIntent[]
+}
+
+model Confirmation {
+  id               String        @id @default(uuid())
+  reservationId    String        @unique
+  confirmationCode String        @unique
+  issuedAt         DateTime      @default(now())
+  deliveryStatus   DeliveryStatus @default(PENDING)
+  pdfUrl           String?
+  payloadJson      String
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  reservation      Reservation   @relation(fields: [reservationId], references: [id])
+}
+
+model AuditLog {
+  id         String    @id @default(uuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  changesJson String?
+  ipAddress  String?
+  userAgent  String?
+  timestamp  DateTime  @default(now())
+  user       User?     @relation(fields: [userId], references: [id])
+}
+
+model Report {
+  id             String    @id @default(uuid())
+  generatedById  String
+  reportType     String
+  filtersJson    String
+  status         String    @default("PENDING")
+  fileUrl        String?
+  generatedAt    DateTime  @default(now())
+  generatedBy    User      @relation(fields: [generatedById], references: [id])
+}
+
+model SyncLog {
+  id            String     @id @default(uuid())
+  reservationId String
+  status        SyncStatus
+  attemptedAt   DateTime   @default(now())
+  retryCount    Int        @default(0)
+  errorMessage  String?
+  lastSyncedAt  DateTime?
+  reservation    Reservation @relation(fields: [reservationId], references: [id])
+}
+
+model Payment {
+  id            String    @id @default(uuid())
+  reservationId String    @unique
+  method        String    // MPESA, CARD, PAYPAL
+  transactionId String?
+  amount        Float
+  currency      String    @default("KES")
+  status        String    @default("PENDING") // PENDING, COMPLETED, FAILED, REFUNDED
+  paidAt        DateTime?
+  createdAt     DateTime  @default(now())
+  reservation   Reservation @relation(fields: [reservationId], references: [id])
+}
+
+model GuestPreference {
+  id          String   @id @default(uuid())
+  clientId    String
+  category    String   // DIETARY, ROOM_TYPE, ACTIVITY_LEVEL
+  value       String
+  notes       String?
+  createdAt   DateTime @default(now())
+  client      Client   @relation(fields: [clientId], references: [id])
+}
+
+model PricingRule {
+  id          String    @id @default(uuid())
+  serviceId   String
+  ruleType    String    // SEASONAL, LAST_MINUTE, LENGTH_OF_STAY
+  multiplier  Float
+  startDate   DateTime
+  endDate     DateTime
+  service     Service   @relation(fields: [serviceId], references: [id])
+}
+
+model Resource {
+  id         String    @id @default(uuid())
+  name       String    // "Boat Alpha", "Guide John"
+  type       String    // VEHICLE, GUIDE, EQUIPMENT
+  capacity   Int?
+  isActive   Boolean   @default(true)
+  assignments Assignment[]
+}
+
+model Assignment {
+  id            String    @id @default(uuid())
+  resourceId    String
+  reservationId String
+  assignedAt    DateTime  @default(now())
+  resource      Resource  @relation(fields: [resourceId], references: [id])
+  reservation   Reservation @relation(fields: [reservationId], references: [id])
+  @@unique([resourceId, reservationId])
+}
+
+model Waiver {
+  id            String    @id @default(uuid())
+  reservationId String    @unique
+  signedAt      DateTime?
+  signatureUrl  String?
+  status        String    @default("UNSIGNED") // UNSIGNED, SIGNED
+  reservation   Reservation @relation(fields: [reservationId], references: [id])
+}
+
+model ServiceRule {
+  id          String   @id @default(uuid())
+  serviceId   String
+  ruleType    String   // CUT_OFF_TIME, MIN_PAX, MAX_PAX
+  value       String   // e.g., "7200" (seconds before departure) or "4"
+  service     Service  @relation(fields: [serviceId], references: [id])
+}
+
+// Legacy tables kept so existing Supabase data is not dropped.
+model Notification {
+  id            String      @id @default(uuid())
+  userId        String?
+  clientId      String?
+  reservationId String?
+  channel       String
+  subject       String
+  message       String
+  status        String      @default("PENDING")
+  sentAt        DateTime?
+  createdAt     DateTime    @default(now())
+  user          User?       @relation(fields: [userId], references: [id])
+  client        Client?     @relation(fields: [clientId], references: [id])
+  reservation   Reservation? @relation(fields: [reservationId], references: [id])
+}
+
+model PaymentIntent {
+  id             String      @id @default(uuid())
+  reservationId  String?
+  stripeIntentId String
+  amount         Float
+  currency       String      @default("usd")
+  status         String
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  reservation    Reservation? @relation(fields: [reservationId], references: [id])
+}

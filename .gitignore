@@ -1,0 +1,38 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Production build
+client/build/
+
+# Logs and runtime output
+*.log
+logs/
+
+# Database certs captured for local TLS (regenerate per environment)
+certs/
+
+# Editor / OS
+.DS_Store
+.vscode/
+
+# Local capture / QA artefacts (documentation figures live in screenshots/)
+/*.png
+/cdp-*.js
+/read-pkg.mjs
+/inspect-supabase*.js
+/check-supabase-pooler.js
+/migrate-supabase-enums.js
+/reset-supabase-demo-users.js
+/seed.js
+/start.mjs
+/start_server.bat
+/migration-report.json
+
+# Generated report exports may contain guest data
+/screenshots/downloads/
