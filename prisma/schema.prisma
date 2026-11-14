@@ -176,6 +176,7 @@ model Payment {
   currency      String    @default("KES")
   status        String    @default("PENDING") // PENDING, COMPLETED, FAILED, REFUNDED
   paidAt        DateTime?
+  attemptedAt   DateTime?
   createdAt     DateTime  @default(now())
   reservation   Reservation @relation(fields: [reservationId], references: [id])
 }

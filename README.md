@@ -63,6 +63,15 @@ Configure all five M-Pesa variables (see `.env.example`). Without them the serve
 **refuses to initiate payment with HTTP 503** and tells the guest to pay at the
 front desk — it never fabricates a payment.
 
+> **Sandbox vs production prompts.** Safaricom's sandbox only delivers STK
+> prompts to its shared test handset (`254708374149`) or the Daraja simulator.
+> Arbitrary real numbers are accepted by the sandbox API but do not ring. To send
+> prompts to real guest numbers, complete Daraja Go Live, use the production
+> shortcode/passkey/keys, set `MPESA_ENVIRONMENT=production`, and point
+> `MPESA_CALLBACK_URL` at a stable public HTTPS domain. Boma sends the STK to the
+> exact number entered (normalized to `2547…`); prompt delivery is controlled by
+> Safaricom, not by the application.
+
 Flow:
 1. Guest books (`POST /api/public/reservations` or authenticated `/api/reservations`).
 2. Guest clicks **Pay now with M-Pesa** (public page: call

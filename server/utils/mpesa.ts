@@ -6,6 +6,11 @@ export const MPESA_ENV = ["MPESA_CONSUMER_KEY", "MPESA_CONSUMER_SECRET", "MPESA_
 export const MPESA_SANDBOX = process.env.MPESA_ENVIRONMENT !== "production"; // sandbox by default
 const BASE = MPESA_SANDBOX ? "https://sandbox.safaricom.co.ke" : "https://api.safaricom.co.ke";
 
+// Keep every Daraja call bounded. Without this a stalled upstream connection
+// leaves the browser waiting until its own timeout and hides a real success.
+const OAUTH_TIMEOUT_MS = 10_000;
+const STK_TIMEOUT_MS = 20_000;
+
 export function mpesaConfigured(): boolean {
   return MPESA_ENV.every((k) => Boolean(process.env[k]));
 }
@@ -18,16 +23,34 @@ export function normalizeKenyanPhone(phone: string): string | null {
   return null;
 }
 
+async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = STK_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Daraja access tokens are valid for an hour. Reusing one removes an OAuth
+// round-trip from every STK request and makes the guest-facing response faster.
+let tokenCache: { token: string; expiresAt: number } | null = null;
+
 async function getAccessToken(): Promise<string> {
+  if (tokenCache && tokenCache.expiresAt > Date.now() + 60_000) return tokenCache.token;
   const key = process.env.MPESA_CONSUMER_KEY!;
   const secret = process.env.MPESA_CONSUMER_SECRET!;
   const basic = Buffer.from(`${key}:${secret}`).toString("base64");
-  const res = await fetch(`${BASE}/oauth/v1/generate?grant_type=client_credentials`, {
+  const res = await fetchWithTimeout(`${BASE}/oauth/v1/generate?grant_type=client_credentials`, {
     headers: { Authorization: `Basic ${basic}` },
-  });
+  }, OAUTH_TIMEOUT_MS);
   const body = (await res.json()) as any;
   if (!res.ok || !body?.access_token) throw new Error(`Daraja OAuth failed (${res.status}): ${body?.errorMessage || body?.error_description || JSON.stringify(body).slice(0, 200)}`);
-  return String(body.access_token);
+  const token = String(body.access_token);
+  const ttlSeconds = Math.max(120, Number(body.expires_in) || 3599);
+  tokenCache = { token, expiresAt: Date.now() + (ttlSeconds - 120) * 1000 };
+  return token;
 }
 
 export type StkResult = { checkoutRequestId: string; merchantRequestId: string; responseCode: string; customerMessage: string };
@@ -60,7 +83,7 @@ export async function stkPush(input: { phone: string; amount: number; accountRef
   const transactionType = process.env.MPESA_TRANSACTION_TYPE === "CustomerBuyGoodsOnline"
     ? "CustomerBuyGoodsOnline"
     : "CustomerPayBillOnline";
-  const res = await fetch(`${BASE}/mpesa/stkpush/v1/processrequest`, {
+  const res = await fetchWithTimeout(`${BASE}/mpesa/stkpush/v1/processrequest`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -76,7 +99,7 @@ export async function stkPush(input: { phone: string; amount: number; accountRef
       AccountReference: input.accountReference.slice(0, 12),
       TransactionDesc: input.description.slice(0, 13),
     }),
-  });
+  }, STK_TIMEOUT_MS);
   const body = (await res.json()) as any;
   if (!res.ok || String(body?.ResponseCode) !== "0") {
     throw new Error(`STK push failed (${res.status}): ${body?.errorMessage || body?.ResponseDescription || body?.CustomerMessage || JSON.stringify(body).slice(0, 300)}`);

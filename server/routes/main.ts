@@ -7,7 +7,7 @@ import jwt from "jsonwebtoken";
 const { v4: uuidv4 } = require("uuid") as { v4: () => string };
 import { sendMail, confirmationEmail, passwordResetEmail, mailerMode } from "../utils/mailer";
 import { sendSms } from "../utils/africastalking";
-import { mpesaConfigured, stkPush, normalizeKenyanPhone, MPESA_ENV } from "../utils/mpesa";
+import { mpesaConfigured, stkPush, normalizeKenyanPhone, MPESA_ENV, MPESA_SANDBOX } from "../utils/mpesa";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
@@ -94,6 +94,31 @@ async function getPublicActorId(): Promise<string> {
 async function attemptStk(reservation: any, phoneInput: string) {
   const phone = normalizeKenyanPhone(String(phoneInput || ""));
   if (!phone) return { ok: false as const, status: 400 as const, body: { error: "A valid Kenyan M-Pesa phone number is required (e.g. 07XXXXXXXX)." } };
+  if (reservation.status === "CANCELLED") {
+    return { ok: false as const, status: 409 as const, body: { error: "This reservation is cancelled. Please create a new booking to pay.", code: "RESERVATION_CANCELLED" } };
+  }
+  // Never overwrite an active checkout: a retry while a prompt is outstanding
+  // would replace the first checkout ID, so its success callback could no
+  // longer be matched. Prompts expire after roughly three minutes.
+  const existingPayment = Array.isArray(reservation.payments) ? reservation.payments[0] : null;
+  if (existingPayment?.status === "COMPLETED") {
+    return { ok: false as const, status: 409 as const, body: { error: "This reservation is already paid.", code: "MPESA_ALREADY_PAID", receipt: existingPayment.transactionId } };
+  }
+  if (existingPayment?.status === "PENDING") {
+    const lastAttempt = existingPayment.attemptedAt || existingPayment.createdAt;
+    const ageMs = Date.now() - new Date(lastAttempt).getTime();
+    if (Number.isFinite(ageMs) && ageMs < 3 * 60 * 1000) {
+      return {
+        ok: false as const,
+        status: 409 as const,
+        body: {
+          error: "An M-Pesa payment request is already in progress for this booking. Check your phone for the prompt; if it did not arrive, wait a moment and try again.",
+          code: "MPESA_PENDING",
+          retryAfterSeconds: Math.max(1, Math.ceil((3 * 60 * 1000 - ageMs) / 1000)),
+        },
+      };
+    }
+  }
   if (!mpesaConfigured()) {
     console.warn(`[mpesa] initiation rejected â€” missing env: ${MPESA_ENV.filter((k) => !process.env[k]).join(", ") || "unknown"}`);
     return { ok: false as const, status: 503 as const, body: { error: "M-Pesa payments are not configured on this server yet. Your reservation is saved â€” please pay at the front desk on arrival.", code: "MPESA_NOT_CONFIGURED" } };
@@ -108,10 +133,10 @@ async function attemptStk(reservation: any, phoneInput: string) {
     const pendingRef = `MPESA-PENDING-${stk.checkoutRequestId}`;
     await prisma.payment.upsert({
       where: { reservationId: reservation.id },
-      create: { reservationId: reservation.id, method: "MPESA", transactionId: pendingRef, amount, currency: "KES", status: "PENDING" },
-      update: { method: "MPESA", transactionId: pendingRef, amount, status: "PENDING", paidAt: null },
+      create: { reservationId: reservation.id, method: "MPESA", transactionId: pendingRef, amount, currency: "KES", status: "PENDING", attemptedAt: new Date() },
+      update: { method: "MPESA", transactionId: pendingRef, amount, status: "PENDING", paidAt: null, attemptedAt: new Date() },
     });
-    return { ok: true as const, amount, phone, checkoutRequestId: stk.checkoutRequestId, body: { status: "PENDING", message: stk.customerMessage, amount, totalAmount, depositPercent, phone } };
+    return { ok: true as const, amount, phone, checkoutRequestId: stk.checkoutRequestId, body: { status: "PENDING", message: stk.customerMessage, amount, totalAmount, depositPercent, phone, sandbox: MPESA_SANDBOX } };
   } catch (e) {
     console.error("[mpesa] STK push error:", (e as Error)?.message || e);
     return { ok: false as const, status: 502 as const, body: { error: `M-Pesa could not be reached right now. Please try again or pay at the front desk. (${(e as Error)?.message?.slice(0, 200) || "upstream error"})` } };
@@ -843,21 +868,56 @@ router.post("/payments/mpesa/callback", async (req: Request, res: Response) => {
     const payment = await prisma.payment.findFirst({ where: { transactionId: pendingRef }, include: { reservation: true } });
     if (!payment) { console.warn(`[mpesa] callback for unknown payment ${pendingRef} â€” acknowledging without action.`); return ack(); }
     if (payment.status === "COMPLETED") return ack(); // idempotent
+    if (payment.status === "REFUNDED") { console.warn(`[mpesa] callback for refunded payment ${pendingRef} — ignored.`); return ack(); }
     if (Number(cb.ResultCode) === 0) {
       const items: any[] = cb.CallbackMetadata?.Item || [];
       const meta = (name: string) => items.find((i) => i?.Name === name)?.Value;
-      const receipt = String(meta("MpesaReceiptNumber") || pendingRef);
-      await prisma.payment.update({ where: { id: payment.id }, data: { status: "COMPLETED", transactionId: receipt, paidAt: new Date(), amount: Number(meta("Amount")) || payment.amount } });
-      await prisma.reservation.update({ where: { id: payment.reservationId }, data: { status: "CONFIRMED", version: { increment: 1 } } });
-      await logAudit(null, "MPESA_PAYMENT_COMPLETE", "Payment", payment.reservationId, JSON.stringify({ receipt, amount: meta("Amount") }), req.ip || "", req.headers["user-agent"] || "");
+      const receipt = String(meta("MpesaReceiptNumber") || "").trim();
+      const paidAmount = Number(meta("Amount"));
+      // Never mark a payment complete without Safaricom's receipt. If the
+      // callback is malformed, return 500 so Safaricom retries instead of
+      // silently losing a real payment.
+      if (!receipt) {
+        console.error(`[mpesa] success callback without a receipt for ${pendingRef} — asking Safaricom to retry.`);
+        return res.status(500).json({ ResultCode: 1, ResultDesc: "Missing receipt, retry" });
+      }
+      if (Number.isFinite(paidAmount) && paidAmount + 0.5 < Number(payment.amount)) {
+        console.error(`[mpesa] amount mismatch for ${pendingRef}: expected ${payment.amount}, got ${paidAmount}`);
+        return res.status(500).json({ ResultCode: 1, ResultDesc: "Amount mismatch, retry" });
+      }
+      // Payment and reservation confirmation must commit together; otherwise a
+      // guest could be charged while the booking stays PENDING.
+      const completed = await prisma.$transaction(async (tx) => {
+        const changed = await tx.payment.updateMany({
+          where: { id: payment.id, status: { in: ["PENDING", "FAILED"] } },
+          data: { status: "COMPLETED", transactionId: receipt, paidAt: new Date(), amount: Number.isFinite(paidAmount) && paidAmount > 0 ? paidAmount : payment.amount },
+        });
+        if (changed.count === 0) return false;
+        await tx.reservation.update({ where: { id: payment.reservationId }, data: { status: "CONFIRMED", version: { increment: 1 } } });
+        return true;
+      });
+      if (!completed) { console.warn(`[mpesa] duplicate callback for ${pendingRef} — already processed.`); return ack(); }
+      try {
+        await logAudit(null, "MPESA_PAYMENT_COMPLETE", "Payment", payment.reservationId, JSON.stringify({ receipt, amount: meta("Amount") }), req.ip || "", req.headers["user-agent"] || "");
+      } catch (e) {
+        console.error("[mpesa] payment completed but audit log failed:", (e as Error)?.message || e);
+      }
       console.log(`[mpesa] payment COMPLETED for reservation ${payment.reservationId} receipt ${receipt}`);
     } else {
-      await prisma.payment.update({ where: { id: payment.id }, data: { status: "FAILED" } });
-      await logAudit(null, "MPESA_PAYMENT_FAILED", "Payment", payment.reservationId, JSON.stringify({ resultCode: cb.ResultCode, resultDesc: cb.ResultDesc }), req.ip || "", req.headers["user-agent"] || "");
-      console.warn(`[mpesa] payment FAILED for reservation ${payment.reservationId}: ${cb.ResultCode} ${cb.ResultDesc || ""}`);
+      const failed = await prisma.payment.updateMany({ where: { id: payment.id, status: "PENDING" }, data: { status: "FAILED" } });
+      if (failed.count > 0) {
+        try {
+          await logAudit(null, "MPESA_PAYMENT_FAILED", "Payment", payment.reservationId, JSON.stringify({ resultCode: cb.ResultCode, resultDesc: cb.ResultDesc }), req.ip || "", req.headers["user-agent"] || "");
+        } catch (e) {
+          console.error("[mpesa] failed payment but audit log failed:", (e as Error)?.message || e);
+        }
+        console.warn(`[mpesa] payment FAILED for reservation ${payment.reservationId}: ${cb.ResultCode} ${cb.ResultDesc || ""}`);
+      }
     }
   } catch (e) {
     console.error("[mpesa] callback processing error:", (e as Error)?.message || e);
+    // A 5xx makes Safaricom retry; a 200 here would discard a real payment.
+    return res.status(500).json({ ResultCode: 1, ResultDesc: "Processing error, retry" });
   }
   return ack();
 });

@@ -1,7 +1,7 @@
 import React from "react";
 import { Routes, Route, Navigate, Link, useNavigate, useLocation, useSearchParams } from "react-router-dom";
 
-const API_BASE = "http://localhost:4000";
+const API_BASE = process.env.REACT_APP_API_BASE || (process.env.NODE_ENV === "development" ? "http://localhost:4000" : "");
 
 class ApiError extends Error {
   status: number;
@@ -38,10 +38,10 @@ function fetchWithTimeout(path: string, init: RequestInit = {}, timeoutMs = 1000
   return fetch(API_BASE + path, { ...init, signal: controller.signal }).finally(() => window.clearTimeout(timer));
 }
 
-async function apiGet<T = any>(path: string): Promise<T> {
+async function apiGet<T = any>(path: string, timeoutMs = 10000): Promise<T> {
   let res: Response;
   try {
-    res = await fetchWithTimeout(path, { headers: authHeaders() });
+    res = await fetchWithTimeout(path, { headers: authHeaders() }, timeoutMs);
   } catch {
     throw new ApiError("The server is taking too long to respond. Please try again.", 0, null);
   }
@@ -54,14 +54,14 @@ async function apiGet<T = any>(path: string): Promise<T> {
   return data as T;
 }
 
-async function apiSend<T = any>(path: string, method: string, body?: any): Promise<T> {
+async function apiSend<T = any>(path: string, method: string, body?: any, timeoutMs = 10000): Promise<T> {
   let res: Response;
   try {
     res = await fetchWithTimeout(path, {
       method,
       headers: authHeaders(body !== undefined),
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    }, timeoutMs);
   } catch {
     throw new ApiError("The server is taking too long to respond. Please try again.", 0, null);
   }
@@ -1519,11 +1519,33 @@ function ClientPortal() {
 
   React.useEffect(() => { void load(); }, [load]);
 
+  function startPortalPolling(r: any) {
+    if (payPollRef.current) window.clearInterval(payPollRef.current);
+    let attempts = 0;
+    payPollRef.current = window.setInterval(async () => {
+      attempts += 1;
+      try {
+        const s = await apiGet(`/api/payments/status/${r.id}`, 15000);
+        if (s?.status === "COMPLETED") {
+          if (payPollRef.current) window.clearInterval(payPollRef.current);
+          setNotice(`Payment received${s.receipt ? ` — receipt ${s.receipt}` : ""}. Your reservation is confirmed.`);
+          await load();
+        } else if (s?.status === "FAILED") {
+          if (payPollRef.current) window.clearInterval(payPollRef.current);
+          setError("The M-Pesa payment was not completed. You can try again.");
+        } else if (attempts >= 24) {
+          if (payPollRef.current) window.clearInterval(payPollRef.current);
+          setError("We could not confirm the M-Pesa request yet. Check your phone for the prompt or contact the reservations desk.");
+        }
+      } catch { /* keep polling; transient network flaps are expected */ }
+    }, 5000);
+  }
+
   async function payForReservation(r: any) {
     setError(""); setNotice("");
     setPayingId(r.id);
     try {
-      const data = await apiSend("/api/payments/mpesa/initiate", "POST", { reservationId: r.id });
+      const data = await apiSend("/api/payments/mpesa/initiate", "POST", { reservationId: r.id }, 45000);
       const depositPercent = Number(data?.depositPercent || 100);
       const charged = Number(data?.amount || 0);
       setNotice(
@@ -1531,22 +1553,18 @@ function ClientPortal() {
           ? `Deposit of KES ${charged.toLocaleString()} requested (${depositPercent}% of KES ${Number(data?.totalAmount || 0).toLocaleString()}). The balance is payable at the property. Enter your M-Pesa PIN.`
           : (data?.message || "Check your phone and enter your M-Pesa PIN to complete the payment.")
       );
-      if (payPollRef.current) window.clearInterval(payPollRef.current);
-      payPollRef.current = window.setInterval(async () => {
-        try {
-          const s = await apiGet(`/api/payments/status/${r.id}`);
-          if (s?.status === "COMPLETED") {
-            if (payPollRef.current) window.clearInterval(payPollRef.current);
-            setNotice(`Payment received${s.receipt ? ` — receipt ${s.receipt}` : ""}. Your reservation is confirmed.`);
-            await load();
-          } else if (s?.status === "FAILED") {
-            if (payPollRef.current) window.clearInterval(payPollRef.current);
-            setError("The M-Pesa payment was not completed. You can try again.");
-          }
-        } catch { /* keep polling; transient network flaps are expected */ }
-      }, 5000);
+      startPortalPolling(r);
     } catch (err: any) {
-      setError(err?.message || "Could not start M-Pesa payment.");
+      if (err?.status === 409 && err?.data?.code === "MPESA_PENDING") {
+        setNotice(err.message);
+        startPortalPolling(r);
+      } else if (err?.status === 0) {
+        // The request may have reached Safaricom before the browser timed out.
+        setNotice("M-Pesa is taking longer than usual. We are still checking the status — if a prompt appears on your phone, enter your PIN. Do not pay twice.");
+        startPortalPolling(r);
+      } else {
+        setError(err?.message || "Could not start M-Pesa payment.");
+      }
     } finally {
       setPayingId(null);
     }
@@ -2183,6 +2201,7 @@ function BookingPage() {
   const [busy, setBusy] = React.useState(false);
   const [payState, setPayState] = React.useState<"idle" | "sending" | "pending" | "done" | "failed" | "unavailable">("idle");
   const [payNotice, setPayNotice] = React.useState("");
+  const [sandboxMode, setSandboxMode] = React.useState(false);
   const pollRef = React.useRef<number | null>(null);
   React.useEffect(() => () => { if (pollRef.current) window.clearInterval(pollRef.current); }, []);
   React.useEffect(() => { fetchServices().then(setServices).catch(() => setError("Could not load the stay options. Check your connection and refresh the page.")); }, []);
@@ -2209,6 +2228,53 @@ function BookingPage() {
     } catch (err: any) { setError(err?.message || "Could not complete the booking."); }
     finally { setBusy(false); }
   }
+  function startPublicPolling() {
+    if (!booking) return;
+    if (pollRef.current) window.clearInterval(pollRef.current);
+    let attempts = 0;
+    pollRef.current = window.setInterval(async () => {
+      attempts += 1;
+      try {
+        const r = await fetchWithTimeout(`/api/public/payments/status/${booking.id}?code=${encodeURIComponent(booking.confirmationCode)}`, {}, 15000);
+        const d = await readJson(r);
+        if (d?.status === "COMPLETED") {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          setPayState("done");
+          setPayNotice(`Payment received${d.receipt ? ` — receipt ${d.receipt}` : ""}. Your reservation is confirmed.`);
+        } else if (d?.status === "FAILED") {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          setPayState("failed");
+          setPayNotice("The M-Pesa payment was not completed. You can try again.");
+        } else if (attempts >= 24) {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          setPayState("unavailable");
+          setPayNotice("We could not confirm the M-Pesa request yet. If a prompt is on your phone, enter your PIN; otherwise try again or pay at the front desk.");
+        }
+      } catch { /* transient network flap — keep polling */ }
+    }, 5000);
+  }
+
+  async function checkPayStatus() {
+    if (!booking) return;
+    try {
+      const r = await fetchWithTimeout(`/api/public/payments/status/${booking.id}?code=${encodeURIComponent(booking.confirmationCode)}`, {}, 15000);
+      const d = await readJson(r);
+      if (d?.status === "COMPLETED") {
+        if (pollRef.current) window.clearInterval(pollRef.current);
+        setPayState("done");
+        setPayNotice(`Payment received${d.receipt ? ` — receipt ${d.receipt}` : ""}. Your reservation is confirmed.`);
+      } else if (d?.status === "FAILED") {
+        if (pollRef.current) window.clearInterval(pollRef.current);
+        setPayState("failed");
+        setPayNotice("The M-Pesa payment was not completed. You can try again.");
+      } else {
+        setPayNotice("M-Pesa has not confirmed the payment yet. Check your phone for the prompt.");
+      }
+    } catch {
+      setPayNotice("Could not reach the server. Please try again.");
+    }
+  }
+
   async function payNow() {
     if (!booking) return;
     setPayState("sending"); setPayNotice("");
@@ -2217,11 +2283,18 @@ function BookingPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reservationId: booking.id, confirmationCode: booking.confirmationCode, phone: phone.trim() }),
-      });
+      }, 45000);
       const data = await readJson(res);
+      if (res.status === 409 && data?.code === "MPESA_PENDING") {
+        setPayState("pending");
+        setPayNotice(data?.error || "A payment request is already in progress. Check your phone for the prompt.");
+        startPublicPolling();
+        return;
+      }
       if (res.status === 503) { setPayState("unavailable"); setPayNotice(data?.error || "M-Pesa is not available on this server yet. Please pay at the front desk on arrival."); return; }
       if (!res.ok) { setPayState("failed"); setPayNotice(data?.error || `Could not start M-Pesa payment (HTTP ${res.status}).`); return; }
       setPayState("pending");
+      setSandboxMode(Boolean(data?.sandbox));
       const depositPercent = Number(data?.depositPercent || 100);
       const charged = Number(data?.amount || 0);
       setPayNotice(
@@ -2229,25 +2302,13 @@ function BookingPage() {
           ? `Deposit of KES ${charged.toLocaleString()} requested (${depositPercent}% of KES ${Number(data?.totalAmount || 0).toLocaleString()}). The balance is payable at the property. Enter your M-Pesa PIN.`
           : (data?.message || "Check your phone and enter your M-Pesa PIN to complete the payment.")
       );
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const r = await fetchWithTimeout(`/api/public/payments/status/${booking.id}?code=${encodeURIComponent(booking.confirmationCode)}`);
-          const d = await readJson(r);
-          if (d?.status === "COMPLETED") {
-            if (pollRef.current) window.clearInterval(pollRef.current);
-            setPayState("done");
-            setPayNotice(`Payment received${d.receipt ? ` — receipt ${d.receipt}` : ""}. Your reservation is confirmed.`);
-          } else if (d?.status === "FAILED") {
-            if (pollRef.current) window.clearInterval(pollRef.current);
-            setPayState("failed");
-            setPayNotice("The M-Pesa payment was not completed. You can try again.");
-          }
-        } catch { /* transient network/TLS flap — keep polling */ }
-      }, 5000);
+      startPublicPolling();
     } catch {
-      setPayState("unavailable");
-      setPayNotice("The server is not responding. Your booking is saved — please pay at the front desk on arrival.");
+      // The request may have reached Safaricom even though this browser timed
+      // out. Keep checking status instead of telling the guest it failed.
+      setPayState("pending");
+      setPayNotice("M-Pesa is taking longer than usual. We are still checking the status — if a prompt appears on your phone, enter your PIN. Do not pay twice.");
+      startPublicPolling();
     }
   }
   return (
@@ -2264,11 +2325,30 @@ function BookingPage() {
               <button className="btn btn-secondary" type="button" onClick={() => setBooking(null)}>Done</button>
             </div>
           )}
-          {(payState === "sending" || payState === "pending") && (
-            <p style={{ margin: 0, color: "#1D4ED8", fontWeight: 600 }}>{payState === "sending" ? "Contacting M-Pesa…" : `Waiting for M-Pesa — ${payNotice}`}</p>
+          {payState === "sending" && (
+            <p style={{ margin: 0, color: "#1D4ED8", fontWeight: 600 }}>Contacting M-Pesa…</p>
+          )}
+          {payState === "pending" && (
+            <div>
+              <p style={{ margin: 0, color: "#1D4ED8", fontWeight: 600 }}>Waiting for M-Pesa — {payNotice}</p>
+              <div className="modal-actions" style={{ justifyContent: "flex-start", marginTop: 10 }}>
+                <button className="btn btn-secondary" type="button" onClick={checkPayStatus}>Check status</button>
+                <button className="btn btn-secondary" type="button" onClick={payNow}>Send again</button>
+              </div>
+              {sandboxMode && (
+                <p style={{ margin: "10px 0 0", fontSize: 13, lineHeight: 1.5, color: "#92400E", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
+                  Sandbox mode: Safaricom only delivers STK prompts to its test handset (254708374149). Real numbers receive prompts after the business goes live.
+                </p>
+              )}
+            </div>
           )}
           {payState === "done" && <Alert tone="success">{payNotice}</Alert>}
-          {payState === "unavailable" && <Alert tone="error">{payNotice}</Alert>}
+          {payState === "unavailable" && (
+            <Alert tone="error">
+              {payNotice}{" "}
+              <button className="btn btn-secondary" type="button" onClick={() => setPayState("idle")} style={{ marginLeft: 8 }}>Try again</button>
+            </Alert>
+          )}
           {payState === "failed" && (
             <Alert tone="error">{payNotice} <button className="btn btn-secondary" type="button" onClick={() => setPayState("idle")} style={{ marginLeft: 8 }}>Try again</button></Alert>
           )}
