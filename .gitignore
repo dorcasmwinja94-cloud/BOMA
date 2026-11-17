@@ -39,3 +39,5 @@ certs/
 # Generated report exports may contain guest data
 /screenshots/downloads/
 .vercel
+.env*
+!.env.example
