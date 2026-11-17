@@ -10,6 +10,9 @@ const BASE = MPESA_SANDBOX ? "https://sandbox.safaricom.co.ke" : "https://api.sa
 // leaves the browser waiting until its own timeout and hides a real success.
 const OAUTH_TIMEOUT_MS = 10_000;
 const STK_TIMEOUT_MS = 20_000;
+// Queries are a recovery path, not the guest-facing initiation. A shorter bound
+// keeps a stalled sandbox/host from blocking the next pending payment.
+const QUERY_TIMEOUT_MS = 10_000;
 
 export function mpesaConfigured(): boolean {
   return MPESA_ENV.every((k) => Boolean(process.env[k]));
@@ -109,5 +112,98 @@ export async function stkPush(input: { phone: string; amount: number; accountRef
     merchantRequestId: String(body.MerchantRequestID),
     responseCode: String(body.ResponseCode),
     customerMessage: String(body.CustomerMessage || "Check your phone to enter your M-Pesa PIN."),
+  };
+}
+
+export type StkQueryResult =
+  | { state: "SUCCESS"; resultCode: string; resultDesc: string; receipt: string; amount?: number; phone?: string }
+  | { state: "FAILED"; resultCode: string; resultDesc: string }
+  | { state: "PENDING"; resultCode: string; resultDesc: string };
+
+// Daraja's STK Push Query endpoint. This is how a payment is recovered when the
+// callback never arrives (tunnel restarted, network flap, phone lost signal).
+// It is read-only: nothing is marked paid unless Safaricom returns a receipt.
+export async function stkQuery(checkoutRequestId: string): Promise<StkQueryResult> {
+  const token = await getAccessToken();
+  const shortcode = process.env.MPESA_SHORTCODE!;
+  const passkey = process.env.MPESA_PASSKEY!;
+  const timestamp = nairobiTimestamp();
+  const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString("base64");
+  const res = await fetchWithTimeout(`${BASE}/mpesa/stkpushquery/v1/query`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      BusinessShortCode: shortcode,
+      Password: password,
+      Timestamp: timestamp,
+      CheckoutRequestID: checkoutRequestId,
+    }),
+  }, QUERY_TIMEOUT_MS);
+
+  let body: any = {};
+  try {
+    body = await res.json();
+  } catch {
+    body = {};
+  }
+
+  // While the customer has not answered the prompt Daraja reports
+  // 500.001.1001 "The transaction is being processed". That is not a failure.
+  const processing = String(body?.errorCode || "") === "500.001.1001"
+    || /transaction is being processed/i.test(String(body?.errorMessage || body?.ResultDesc || ""));
+  if (processing) {
+    return { state: "PENDING", resultCode: "", resultDesc: "The transaction is being processed" };
+  }
+
+  if (!res.ok) {
+    throw new Error(`STK query failed (${res.status}): ${body?.errorMessage || body?.ResultDesc || JSON.stringify(body).slice(0, 300)}`);
+  }
+
+  const items: any[] = body?.CallbackMetadata?.Item || [];
+  const meta = (name: string) => items.find((item: any) => item?.Name === name)?.Value;
+  const resultCode = String(body?.ResultCode ?? "");
+  const resultDesc = String(body?.ResultDesc || body?.ResponseDescription || "");
+  const receipt = String(meta("MpesaReceiptNumber") || "").trim();
+  const paidAmount = Number(meta("Amount"));
+  const phone = meta("PhoneNumber") ? String(meta("PhoneNumber")) : undefined;
+
+  // 4999 / "still under processing" is an in-flight state, not a failure.
+  if (resultCode === "4999" || /still under processing|being processed/i.test(resultDesc)) {
+    return { state: "PENDING", resultCode, resultDesc };
+  }
+
+  if (resultCode === "0") {
+    if (receipt) {
+      return {
+        state: "SUCCESS",
+        resultCode,
+        resultDesc,
+        receipt,
+        amount: Number.isFinite(paidAmount) ? paidAmount : undefined,
+        phone,
+      };
+    }
+    // A "success" response without a receipt is not proof of payment.
+    return { state: "PENDING", resultCode, resultDesc: resultDesc || "Awaiting receipt" };
+  }
+
+  // Only classify codes known to be final as failures. An unknown code could
+  // still be in flight, and wrongly failing a paid guest is worse than waiting
+  // for the callback (or the next query).
+  const terminalCodes = new Set(["1", "1001", "1019", "1032", "1037", "2001"]);
+  if (terminalCodes.has(resultCode)) return { state: "FAILED", resultCode, resultDesc };
+  return { state: "PENDING", resultCode, resultDesc };
+}
+
+// Used by `npm run check:payments` to verify credentials without charging anyone.
+export async function verifyDarajaConnection(): Promise<{ mode: "sandbox" | "production"; shortcode: string; callbackUrl: string }> {
+  if (!mpesaConfigured()) {
+    throw new Error(`Missing M-Pesa environment variables: ${MPESA_ENV.filter((key) => !process.env[key]).join(", ")}`);
+  }
+  await getAccessToken();
+  return {
+    mode: MPESA_SANDBOX ? "sandbox" : "production",
+    shortcode: String(process.env.MPESA_SHORTCODE || ""),
+    callbackUrl: String(process.env.MPESA_CALLBACK_URL || ""),
   };
 }

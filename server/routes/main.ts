@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require("uuid") as { v4: () => string };
 import { sendMail, confirmationEmail, passwordResetEmail, mailerMode } from "../utils/mailer";
 import { sendSms } from "../utils/africastalking";
 import { mpesaConfigured, stkPush, normalizeKenyanPhone, MPESA_ENV, MPESA_SANDBOX } from "../utils/mpesa";
+import { completePayment, failPayment, reconcilePayment, PAYMENT_PENDING_PREFIX } from "../utils/paymentRecovery";
 
 const router = Router();
 const JWT_SECRET = process.env.JWT_SECRET || "secret";
@@ -104,6 +105,9 @@ async function attemptStk(reservation: any, phoneInput: string) {
   if (existingPayment?.status === "COMPLETED") {
     return { ok: false as const, status: 409 as const, body: { error: "This reservation is already paid.", code: "MPESA_ALREADY_PAID", receipt: existingPayment.transactionId } };
   }
+  if (existingPayment?.status === "REFUNDED") {
+    return { ok: false as const, status: 409 as const, body: { error: "This payment was refunded. Please contact the reservations desk before paying again.", code: "MPESA_REFUNDED" } };
+  }
   if (existingPayment?.status === "PENDING") {
     const lastAttempt = existingPayment.attemptedAt || existingPayment.createdAt;
     const ageMs = Date.now() - new Date(lastAttempt).getTime();
@@ -117,6 +121,34 @@ async function attemptStk(reservation: any, phoneInput: string) {
           retryAfterSeconds: Math.max(1, Math.ceil((3 * 60 * 1000 - ageMs) / 1000)),
         },
       };
+    }
+    // Before replacing an old checkout, ask Safaricom what happened to it. A
+    // success here means the guest was already charged; a prompt still waiting
+    // for a PIN must not be replaced by a second one.
+    const outcome = await reconcilePayment(existingPayment.id, { force: true });
+    if (outcome === "COMPLETED") {
+      const settled = await prisma.payment.findUnique({ where: { reservationId: reservation.id }, select: { transactionId: true } });
+      return { ok: false as const, status: 409 as const, body: { error: "This reservation is already paid.", code: "MPESA_ALREADY_PAID", receipt: settled?.transactionId || null } };
+    }
+    if (outcome === "PENDING") {
+      return {
+        ok: false as const,
+        status: 409 as const,
+        body: {
+          error: "Safaricom is still confirming the earlier M-Pesa request. Check your phone for the prompt; if it did not arrive, wait a minute and try again.",
+          code: "MPESA_PENDING",
+          retryAfterSeconds: 60,
+        },
+      };
+    }
+    // A FAILED checkout may be replaced. A SKIPPED one needs a fresh look at the
+    // row so a callback that completed it mid-flight is never overwritten.
+    const latest = await prisma.payment.findUnique({ where: { reservationId: reservation.id } });
+    if (latest?.status === "COMPLETED") {
+      return { ok: false as const, status: 409 as const, body: { error: "This reservation is already paid.", code: "MPESA_ALREADY_PAID", receipt: latest.transactionId } };
+    }
+    if (latest?.status === "REFUNDED") {
+      return { ok: false as const, status: 409 as const, body: { error: "This payment was refunded. Please contact the reservations desk before paying again.", code: "MPESA_REFUNDED" } };
     }
   }
   if (!mpesaConfigured()) {
@@ -141,6 +173,17 @@ async function attemptStk(reservation: any, phoneInput: string) {
     console.error("[mpesa] STK push error:", (e as Error)?.message || e);
     return { ok: false as const, status: 502 as const, body: { error: `M-Pesa could not be reached right now. Please try again or pay at the front desk. (${(e as Error)?.message?.slice(0, 200) || "upstream error"})` } };
   }
+}
+
+// A guest's status poll doubles as a recovery trigger. The Daraja query runs in
+// the background so the HTTP response stays fast; the next poll picks up the
+// reconciled state.
+function nudgeReconciliation(payment: { id: string; status: string; transactionId: string | null; attemptedAt: Date | null; createdAt: Date }) {
+  if (payment.status !== "PENDING") return;
+  if (!payment.transactionId?.startsWith(PAYMENT_PENDING_PREFIX)) return;
+  const ageMs = Date.now() - new Date(payment.attemptedAt || payment.createdAt).getTime();
+  if (ageMs < 20_000) return;
+  reconcilePayment(payment.id).catch((e) => console.warn("[payments] status reconciliation failed:", (e as Error)?.message || e));
 }
 
 // Atomically checks for duplicates and creates the reservation, its
@@ -853,12 +896,14 @@ router.get("/public/payments/status/:reservationId", async (req: Request, res: R
   if (!reservation || reservation.confirmation?.confirmationCode !== confirmationCode) return res.status(404).json({ error: "Reservation not found." });
   const payment = await prisma.payment.findUnique({ where: { reservationId: reservation.id } });
   if (!payment) return res.json({ status: "NONE" });
+  nudgeReconciliation(payment);
   res.json({ status: payment.status, method: payment.method, amount: payment.amount, currency: payment.currency, receipt: payment.status === "COMPLETED" ? payment.transactionId : null, paidAt: payment.paidAt });
 });
 
 // Safaricom Daraja calls this endpoint (publicly, no auth) with the outcome of
-// the STK prompt. Always answer 200 to avoid retry storms; unknown callbacks are
-// logged and accepted. On success the reservation is auto-confirmed.
+// the STK prompt. Valid callbacks are acknowledged with 200; malformed success
+// callbacks and processing failures return 5xx so Safaricom retries instead of
+// losing a real payment. Unknown checkouts are logged and accepted.
 router.post("/payments/mpesa/callback", async (req: Request, res: Response) => {
   const ack = () => res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
   try {
@@ -885,34 +930,12 @@ router.post("/payments/mpesa/callback", async (req: Request, res: Response) => {
         console.error(`[mpesa] amount mismatch for ${pendingRef}: expected ${payment.amount}, got ${paidAmount}`);
         return res.status(500).json({ ResultCode: 1, ResultDesc: "Amount mismatch, retry" });
       }
-      // Payment and reservation confirmation must commit together; otherwise a
-      // guest could be charged while the booking stays PENDING.
-      const completed = await prisma.$transaction(async (tx) => {
-        const changed = await tx.payment.updateMany({
-          where: { id: payment.id, status: { in: ["PENDING", "FAILED"] } },
-          data: { status: "COMPLETED", transactionId: receipt, paidAt: new Date(), amount: Number.isFinite(paidAmount) && paidAmount > 0 ? paidAmount : payment.amount },
-        });
-        if (changed.count === 0) return false;
-        await tx.reservation.update({ where: { id: payment.reservationId }, data: { status: "CONFIRMED", version: { increment: 1 } } });
-        return true;
-      });
+      // Payment and reservation confirmation commit together, and the update is
+      // conditional so a simultaneous reconciler/callback cannot double-apply it.
+      const completed = await completePayment(payment, receipt, paidAmount, "callback");
       if (!completed) { console.warn(`[mpesa] duplicate callback for ${pendingRef} — already processed.`); return ack(); }
-      try {
-        await logAudit(null, "MPESA_PAYMENT_COMPLETE", "Payment", payment.reservationId, JSON.stringify({ receipt, amount: meta("Amount") }), req.ip || "", req.headers["user-agent"] || "");
-      } catch (e) {
-        console.error("[mpesa] payment completed but audit log failed:", (e as Error)?.message || e);
-      }
-      console.log(`[mpesa] payment COMPLETED for reservation ${payment.reservationId} receipt ${receipt}`);
     } else {
-      const failed = await prisma.payment.updateMany({ where: { id: payment.id, status: "PENDING" }, data: { status: "FAILED" } });
-      if (failed.count > 0) {
-        try {
-          await logAudit(null, "MPESA_PAYMENT_FAILED", "Payment", payment.reservationId, JSON.stringify({ resultCode: cb.ResultCode, resultDesc: cb.ResultDesc }), req.ip || "", req.headers["user-agent"] || "");
-        } catch (e) {
-          console.error("[mpesa] failed payment but audit log failed:", (e as Error)?.message || e);
-        }
-        console.warn(`[mpesa] payment FAILED for reservation ${payment.reservationId}: ${cb.ResultCode} ${cb.ResultDesc || ""}`);
-      }
+      await failPayment(payment, String(cb.ResultCode), String(cb.ResultDesc || ""), "callback");
     }
   } catch (e) {
     console.error("[mpesa] callback processing error:", (e as Error)?.message || e);
@@ -934,6 +957,7 @@ router.get("/payments/status/:reservationId", authenticate, async (req: AuthReq,
   }
   const payment = await prisma.payment.findUnique({ where: { reservationId } });
   if (!payment) return res.json({ status: "NONE" });
+  nudgeReconciliation(payment);
   res.json({ status: payment.status, method: payment.method, amount: payment.amount, currency: payment.currency, receipt: payment.status === "COMPLETED" ? payment.transactionId : null, paidAt: payment.paidAt });
 });
 

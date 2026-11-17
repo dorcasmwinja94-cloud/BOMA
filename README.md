@@ -78,13 +78,22 @@ Flow:
    `POST /api/public/payments/mpesa/initiate` with the reservation id and the
    confirmation code from the booking; authenticated clients: `POST /api/payments/mpesa/initiate`).
    The server sends an STK prompt to the guest's phone.
-3. Safaricom calls `POST /api/payments/mpesa/callback` (public, always answered
-   `200`). On success the payment is marked `COMPLETED` with the M-Pesa receipt
-   and the reservation is auto-confirmed.
+3. Safaricom calls `POST /api/payments/mpesa/callback` (public). Valid outcomes
+   are acknowledged with `200`; malformed success callbacks and processing
+   failures return `5xx` so Safaricom retries instead of losing a payment. On
+   success the payment is marked `COMPLETED` with the M-Pesa receipt and a
+   still-pending reservation is auto-confirmed.
 4. The client polls `GET /api/payments/status/:reservationId` (or
    `GET /api/public/payments/status/:reservationId?code=<confirmation code>`)
    every 5 seconds and shows the receipt.
 5. Staff can record refunds via `POST /api/payments/:id/refund` (manager/officer).
+
+**Missed callbacks are recovered automatically.** Pending checkouts are queried
+against Daraja once a minute, whenever a guest checks payment status, and before
+an old checkout is replaced by a retry. A payment is only ever completed when
+Safaricom returns a real receipt, so a dropped callback cannot leave a charged
+guest stuck on `PENDING`. A late payment for a cancelled booking is recorded for
+staff review/refund but never silently re-confirms the cancelled booking.
 
 `MPESA_ENVIRONMENT=production` switches the Daraja base URL from sandbox to live.
 `MPESA_CALLBACK_URL` must be publicly reachable over HTTPS (your domain, or a
@@ -95,6 +104,23 @@ tunnel such as ngrok during sandbox testing).
 reservation total collected by STK push. Set it to e.g. `30` to take a 30%
 deposit; the client shows the deposit and balance before the guest enters their
 PIN, and the property collects the balance at check-in.
+
+### Go Live checklist
+1. Complete Daraja Go Live for the business Paybill or Buy Goods Till. Safaricom
+   issues the production shortcode and passkey.
+2. Create production app keys in the Daraja portal (consumer key and secret).
+3. Set in `.env`:
+   - `MPESA_ENVIRONMENT=production`
+   - `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`
+   - `MPESA_SHORTCODE`, `MPESA_PASSKEY`
+   - `MPESA_CALLBACK_URL=https://your-domain/api/payments/mpesa/callback`
+   - `MPESA_TRANSACTION_TYPE` (`CustomerPayBillOnline` or `CustomerBuyGoodsOnline`)
+   - `MPESA_DEPOSIT_PERCENT` (e.g. `30` for a 30% deposit)
+4. Use a **stable** public HTTPS domain (not a `trycloudflare.com` tunnel).
+5. Run `npm run check:payments` — it verifies the variables, Daraja OAuth, and
+   public callback reachability without charging anyone.
+6. Make a small live payment to your own number and confirm it reaches
+   `COMPLETED` with an M-Pesa receipt in the client portal and staff payments API.
 
 ## Email & SMS delivery
 - Email: set `SMTP_*` (any provider — SendGrid, Mailgun, SES, Gmail app passwords).

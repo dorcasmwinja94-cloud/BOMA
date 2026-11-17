@@ -7,6 +7,8 @@ import { Server } from "socket.io";
 import { prisma, dbState } from "./utils/prisma";
 import router from "./routes/main";
 import { startReminderScheduler } from "./utils/reminders";
+import { startPaymentReconciler } from "./utils/paymentRecovery";
+import { mpesaConfigured, MPESA_SANDBOX } from "./utils/mpesa";
 
 const isProd = process.env.NODE_ENV === "production" || process.argv.includes("--prod");
 // Same-origin SPA needs no CORS in production; cross-origin dev defaults to open.
@@ -19,6 +21,12 @@ const io = new Server(server, { cors: { origin: corsOrigin === false ? undefined
 if (isProd) app.set("trust proxy", 1);
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
+
+// Liveness only: no database probe, so a setup check through a tunnel cannot
+// flip the global DB state or time out on a slow pooler round-trip.
+app.get("/health/live", (_req, res) => {
+  res.json({ status: "ok", service: "boma" });
+});
 
 app.get("/health", async (_req, res) => {
   try {
@@ -81,10 +89,21 @@ async function start() {
   if (!dbState.ready) {
     console.warn("[startup] Continuing in DEGRADED mode (no DB). Public catalog uses fallback data; sign-in and booking return a clean 503 until the database recovers.");
   }
+  if (mpesaConfigured()) {
+    let callbackHost = "(invalid)";
+    try { callbackHost = new URL(String(process.env.MPESA_CALLBACK_URL)).host; } catch { /* keep placeholder */ }
+    console.log(`[mpesa] mode=${MPESA_SANDBOX ? "sandbox" : "production"} shortcode=${process.env.MPESA_SHORTCODE} callback-host=${callbackHost}`);
+    if (MPESA_SANDBOX && callbackHost.includes("trycloudflare.com")) {
+      console.warn("[mpesa] callback uses a temporary trycloudflare tunnel — use a stable HTTPS domain for production.");
+    }
+  } else {
+    console.warn("[mpesa] not configured — payment initiation returns 503; guests can still pay at the front desk.");
+  }
   const port = Number(process.env.PORT || 4000);
   server.listen(port, () => {
     console.log(`Boma server running on port ${port}`);
     startReminderScheduler();
+    startPaymentReconciler();
   });
 }
 start();

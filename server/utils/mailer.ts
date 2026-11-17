@@ -66,6 +66,46 @@ export function confirmationEmail(input: { guestName: string; code: string; serv
   return { subject: `Boma confirmation ${input.code}`, html, text };
 }
 
+export function paymentReceiptEmail(input: {
+  guestName: string;
+  code: string;
+  serviceName: string;
+  receipt: string;
+  amount: number;
+  total: number;
+  balance: number;
+  currency?: string;
+  reservationStatus?: string | null;
+}) {
+  const currency = input.currency || "KES";
+  const money = (value: number) => Number(value || 0).toLocaleString();
+  const status = String(input.reservationStatus || "");
+  const note = status === "CANCELLED"
+    ? "This booking is cancelled. Our reservations team will review the payment and contact you about a refund."
+    : status === "FLAGGED_DUPLICATE"
+      ? "This booking is flagged as a possible duplicate. Our reservations team will review the payment and contact you."
+      : "Your reservation is confirmed. Keep this receipt for your records.";
+  const html = shell(`
+    <h2 style="margin:0 0 12px">Payment received</h2>
+    <p style="margin:0 0 12px">Hi ${escapeHtml(input.guestName)},</p>
+    <p style="margin:0 0 16px">We have received your M-Pesa payment for booking <strong>${escapeHtml(input.code)}</strong>.</p>
+    <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:12px;padding:16px;margin:16px 0;text-align:center">
+      <div style="font-size:12px;color:#475569;text-transform:uppercase;letter-spacing:1px">M-Pesa receipt</div>
+      <div style="font-size:26px;font-weight:800;color:#1D4ED8;letter-spacing:2px;margin-top:6px">${escapeHtml(input.receipt)}</div>
+    </div>
+    <table style="width:100%;font-size:14px;border-collapse:collapse">
+      <tr><td style="padding:6px 0;color:#475569">Service</td><td style="padding:6px 0;text-align:right;font-weight:600">${escapeHtml(input.serviceName)}</td></tr>
+      <tr><td style="padding:6px 0;color:#475569">Amount paid</td><td style="padding:6px 0;text-align:right;font-weight:600">${currency} ${money(input.amount)}</td></tr>
+      <tr><td style="padding:6px 0;color:#475569">Booking total</td><td style="padding:6px 0;text-align:right">${currency} ${money(input.total)}</td></tr>
+      <tr><td style="padding:6px 0;color:#475569">Balance</td><td style="padding:6px 0;text-align:right">${currency} ${money(input.balance)}</td></tr>
+    </table>
+    <p style="margin:16px 0 0;font-size:13px;color:#475569">${escapeHtml(note)}</p>
+    <p style="margin:12px 0 0"><a href="${CLIENT_URL}/client" style="display:inline-block;background:#2563EB;color:#FFFFFF;padding:10px 18px;border-radius:8px;text-decoration:none">View my bookings</a></p>
+  `);
+  const text = `Boma — payment received\nReceipt: ${input.receipt}\nBooking: ${input.code}\nService: ${input.serviceName}\nAmount paid: ${currency} ${money(input.amount)}\nBooking total: ${currency} ${money(input.total)}\nBalance: ${currency} ${money(input.balance)}\n${note}`;
+  return { subject: `Boma payment receipt ${input.receipt}`, html, text };
+}
+
 export function reminderEmail(input: { guestName: string; code: string; serviceName: string; checkIn: string; checkOut: string; guests: number; when: string }) {
   const html = shell(`
     <h2 style="margin:0 0 12px">Reminder: your Boma booking is ${escapeHtml(input.when)}</h2>
