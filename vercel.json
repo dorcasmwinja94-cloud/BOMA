@@ -1,7 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "npx prisma generate",
-  "outputDirectory": "public",
+  "installCommand": "npm install && npm --prefix client install",
+  "buildCommand": "npm --prefix client run build",
+  "outputDirectory": "client/build",
+  "regions": ["us-west-1"],
   "functions": {
     "api/index.ts": {
       "maxDuration": 120,
@@ -10,8 +12,12 @@
   },
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/api/(.*)",
       "destination": "/api/index"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ],
   "headers": [
