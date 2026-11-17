@@ -111,13 +111,25 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     });
   }
 
-  // Always return JSON on unhandled errors (avoids HTML error pages in the SPA)
-  // and map the two common parser failures to their proper status codes.
+  // Always return JSON on unhandled errors (avoids HTML error pages in the SPA).
+  // Malformed bodies surface with different shapes depending on the runtime
+  // (body-parser SyntaxError locally, plain Error from the platform's body
+  // getter on serverless), so match them all as client errors: a bad request
+  // must never look like a server failure.
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    if (err?.type === "entity.too.large") {
+    const status = Number(err?.statusCode ?? err?.status ?? 0);
+    const type = String(err?.type ?? "");
+    const message = String(err?.message ?? "");
+    if (status === 413 || type === "entity.too.large") {
       return res.status(413).json({ error: "Request body is too large." });
     }
-    if (err instanceof SyntaxError && "body" in err) {
+    if (
+      status === 400 ||
+      type === "entity.parse.failed" ||
+      type === "entity.verify.failed" ||
+      (err instanceof SyntaxError && "body" in err) ||
+      /invalid json/i.test(message)
+    ) {
       return res.status(400).json({ error: "Invalid JSON body." });
     }
     console.error("[api] Unhandled error:", err);
