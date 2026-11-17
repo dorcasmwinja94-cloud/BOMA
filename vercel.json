@@ -12,6 +12,14 @@
   },
   "rewrites": [
     {
+      "source": "/health/live",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/health",
+      "destination": "/api/index"
+    },
+    {
       "source": "/api/(.*)",
       "destination": "/api/index"
     },
