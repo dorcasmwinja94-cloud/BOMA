@@ -1,7 +1,12 @@
 import React from "react";
 import { Routes, Route, Navigate, Link, useNavigate, useLocation, useSearchParams } from "react-router-dom";
 
-const API_BASE = process.env.REACT_APP_API_BASE || (process.env.NODE_ENV === "development" ? "http://localhost:4000" : "");
+const API_BASE = (
+  process.env.REACT_APP_API_BASE ||
+  // Backward compatibility with the older variable name used in local .env files.
+  process.env.REACT_APP_API_URL ||
+  (process.env.NODE_ENV === "development" ? "http://localhost:4000" : "")
+).replace(/\/+$/, "");
 
 class ApiError extends Error {
   status: number;

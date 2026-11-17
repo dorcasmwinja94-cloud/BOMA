@@ -1,8 +1,9 @@
 ﻿import { Router, Request, Response } from "express";
 import rateLimit from "express-rate-limit";
 import { AuthReq, authenticate, requireRole, logAudit } from "../middleware/auth";
-import { prisma, dbState } from "../utils/prisma";
+import { prisma } from "../utils/prisma";
 import { hashPassword, verifyPassword } from "../utils/auth";
+import { getJwtSecret } from "../utils/runtimeConfig";
 import jwt from "jsonwebtoken";
 const { v4: uuidv4 } = require("uuid") as { v4: () => string };
 import { sendMail, confirmationEmail, passwordResetEmail, mailerMode } from "../utils/mailer";
@@ -11,7 +12,6 @@ import { mpesaConfigured, stkPush, normalizeKenyanPhone, MPESA_ENV, MPESA_SANDBO
 import { completePayment, failPayment, reconcilePayment, PAYMENT_PENDING_PREFIX } from "../utils/paymentRecovery";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "secret";
 const MAX_LOGIN_ATTEMPTS = Number(process.env.MAX_LOGIN_ATTEMPTS || 5);
 const LOCKOUT_MINUTES = Number(process.env.LOCKOUT_MINUTES || 15);
 const ROLES = ["MANAGER", "RESERVATION_OFFICER", "CLIENT"];
@@ -331,7 +331,7 @@ router.post("/auth/login", loginLimiter, async (req: Request, res: Response) => 
     data: { failedLoginAttempts: 0, lockedUntil: null },
   });
   await logAudit(user.id, "LOGIN", "User", user.id, null, req.ip || "", req.headers["user-agent"] || "");
-  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, fullName: user.fullName }, JWT_SECRET, { expiresIn: "8h" });
+  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, fullName: user.fullName }, getJwtSecret(), { expiresIn: "8h" });
   res.json({ token, user: { id: user.id, fullName: user.fullName, email: user.email, role: user.role } });
 });
 
@@ -1031,21 +1031,21 @@ const SERVICE_FALLBACK = [
 let servicesCache: any[] | null = null;
 
 router.get("/public/services", async (req: Request, res: Response) => {
-  if (dbState.ready) {
-    try {
-      const services = await prisma.service.findMany({
-        where: { isActive: true },
-        orderBy: { name: "asc" },
-        select: {
-          id: true, name: true, description: true, imageUrl: true, images: true,
-          pricePerUnit: true, serviceType: true, capacity: true, location: true,
-        },
-      });
-      servicesCache = services;
-      return res.json(services);
-    } catch (e) {
-      console.warn("[public/services] DB query failed, serving fallback:", (e as Error)?.message || e);
-    }
+  // Always attempt the database. The old dbState gate made serverless instances
+  // serve fallback data forever because nothing had called the startup connect.
+  try {
+    const services = await prisma.service.findMany({
+      where: { isActive: true },
+      orderBy: { name: "asc" },
+      select: {
+        id: true, name: true, description: true, imageUrl: true, images: true,
+        pricePerUnit: true, serviceType: true, capacity: true, location: true,
+      },
+    });
+    servicesCache = services;
+    return res.json(services);
+  } catch (e) {
+    console.warn("[public/services] DB query failed, serving fallback:", (e as Error)?.message || e);
   }
   // Degraded path: serve the last good response, else a static fallback list.
   res.setHeader("X-Source", "fallback");

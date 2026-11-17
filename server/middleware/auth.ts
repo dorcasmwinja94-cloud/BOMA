@@ -1,8 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { prisma } from "../utils/prisma";
-
-const JWT_SECRET = process.env.JWT_SECRET || "secret";
+import { getJwtSecret } from "../utils/runtimeConfig";
 
 export interface AuthReq extends Request {
   user?: {
@@ -18,9 +17,17 @@ export function authenticate(req: AuthReq, res: Response, next: NextFunction) {
   if (!auth?.startsWith("Bearer ")) {
     return res.status(401).json({ error: "Missing token" });
   }
+  let secret: string;
+  try {
+    // A missing production secret is a server configuration error, not an
+    // invalid user token. Surface it as a 500 rather than a misleading 401.
+    secret = getJwtSecret();
+  } catch (e) {
+    return next(e);
+  }
   try {
     const token = auth.slice(7);
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, secret) as any;
     req.user = decoded;
     next();
   } catch {

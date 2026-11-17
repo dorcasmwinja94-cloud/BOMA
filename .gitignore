@@ -9,6 +9,8 @@ client/node_modules/
 
 # Production build
 client/build/
+dist/
+.vercel/
 
 # Logs and runtime output
 *.log
@@ -36,3 +38,4 @@ certs/
 
 # Generated report exports may contain guest data
 /screenshots/downloads/
+.vercel

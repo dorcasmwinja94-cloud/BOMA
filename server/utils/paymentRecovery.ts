@@ -298,7 +298,10 @@ export async function runPaymentReconciliation(): Promise<{ checked: number; com
         ],
       },
       orderBy: { createdAt: "asc" },
-      take: 20,
+      // Keep each cron invocation bounded. Ten stalled Daraja queries at 10s
+      // each, plus the 750ms serialization gap, stay well inside the function
+      // duration; the next sweep picks up anything left.
+      take: 10,
     });
 
     let completed = 0;

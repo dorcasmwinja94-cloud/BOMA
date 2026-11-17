@@ -4,29 +4,7 @@
 //
 // It checks: required variables, callback URL shape, Daraja OAuth credentials,
 // and whether the public callback origin is reachable from this machine.
-import fs from "fs";
-import path from "path";
-
-function loadEnv(file = path.join(process.cwd(), ".env")): void {
-  try {
-    if (typeof (process as any).loadEnvFile === "function") {
-      (process as any).loadEnvFile(file);
-      return;
-    }
-  } catch {
-    // Fall through to the small parser below.
-  }
-  if (!fs.existsSync(file)) return;
-  for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
-    if (!match) continue;
-    let value = match[2].trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (process.env[match[1]] === undefined) process.env[match[1]] = value;
-  }
-}
+import { loadEnv } from "../utils/loadEnv";
 
 async function probeCallback(callbackUrl: string): Promise<boolean> {
   const origin = new URL(callbackUrl).origin;

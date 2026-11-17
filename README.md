@@ -21,13 +21,13 @@ Professional reservation management platform for Kenyan accommodation, tours, be
 ### 1. Environment
 Copy `.env.example` to `.env` and fill in real values. Never commit `.env`.
 
-Use the **Supabase session pooler** URL (port `5432`) for Prisma. The direct
-`db.<project-ref>.supabase.co` host may resolve to IPv6 only, and port `6543`
-(transaction pooler) is not suitable for Prisma. If your network inspects TLS,
-capture the pooler chain (`node fetch-pooler-cert.js`) and set `sslrootcert` in
-`DATABASE_URL` accordingly. If neither is configured the server retries and then
-boots in **degraded mode**: the public catalog is served from a cached/static
-fallback and DB endpoints return a clean `503` — the site never hard-crashes.
+Use the **Supabase transaction pooler** (port `6543`) for the Vercel API project:
+```
+postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres?pgbouncer=true&connection_limit=1&sslmode=require
+```
+- Do **not** include `sslrootcert=C:/...` — that local file path does not exist in the Vercel runtime; use `sslmode=require` alone.
+- `pgbouncer=true&connection_limit=1` prevents one function from holding the pooled connection that others need.
+- The **session pooler** (port `5432`) works locally and for CLI migrations (`prisma generate`, `prisma migrate deploy`), but short-lived Vercel functions can exhaust its connection limit. If you connect the repository under Supabase Dashboard → Integrations → GitHub, the platform may inject its own `DATABASE_URL` for preview branches. In that case, you can either let Supabase inject it (recommended for preview branches) or set a custom one as above for production deployments.
 
 ### 2. Install
 ```bash
@@ -119,7 +119,11 @@ PIN, and the property collects the balance at check-in.
 4. Use a **stable** public HTTPS domain (not a `trycloudflare.com` tunnel).
 5. Run `npm run check:payments` — it verifies the variables, Daraja OAuth, and
    public callback reachability without charging anyone.
-6. Make a small live payment to your own number and confirm it reaches
+6. Run `npm run check:go-live` — it also checks the database, migrations, demo
+   accounts, JWT/CRON secrets and messaging configuration.
+7. Disable every demo/QA account (see `docs/GO-LIVE.md` §8) before real guests
+   can reach the site.
+8. Make a small live payment to your own number and confirm it reaches
    `COMPLETED` with an M-Pesa receipt in the client portal and staff payments API.
 
 ## Email & SMS delivery
@@ -136,15 +140,25 @@ PIN, and the property collects the balance at check-in.
   reminder to confirmed guests whose check-in is tomorrow (24–48h ahead) and
   again on the arrival day. Each stage is recorded in the `AuditLog`
   (`REMINDER_48H` / `REMINDER_SAME_DAY`) so a guest is never reminded twice;
-  delivery uses the same SMTP and Africa's Talking channels.
+  delivery uses the same SMTP and Africa's Talking channels. On Vercel the same
+  sweep runs through `GET /api/cron/reminders` (see `docs/GO-LIVE.md` §6).
 
 ## Production deployment
+
+The canonical runbook is **[docs/GO-LIVE.md](docs/GO-LIVE.md)**. It covers the
+two-project Vercel deployment (`boma-api` + `boma-client`), Supabase transaction
+pooler settings, baseline migrations, external cron, M-Pesa Go Live and the
+pre-launch data checks.
+
+### Single host (VPS / PM2)
+
 ```bash
-npm install
-npm run build            # builds client/ into client/build
+npm ci
+npm run build            # builds client/build and dist/server
 npx prisma migrate deploy
-NODE_ENV=production PORT=4000 npm start
+NODE_ENV=production PORT=4000 node dist/server/index.js --prod
 ```
+
 In production the same Node process serves the built client (SPA fallback for
 client-side routes) and the API under `/api` on the same origin — no CORS is
 needed and none is opened. Put the process behind a TLS-terminating reverse
@@ -154,12 +168,15 @@ proxy (nginx/Caddy) or your platform's load balancer.
 ```bash
 npm install -g pm2
 npm run build
+npx prisma migrate deploy
 pm2 start ecosystem.config.js
 pm2 save
 ```
-`ecosystem.config.js` runs the API as `boma` with automatic restarts. Alternatively
-use `systemd`/`docker` — the contract is: `NODE_ENV=production npm start` on a
-single port with `client/build` present.
+`ecosystem.config.js` runs the compiled `dist/server/index.js` as `boma` with
+automatic restarts. `npm run start:prod` builds the server and does the same
+thing without PM2. Use `systemd`/`docker` if you prefer — the contract is:
+run `node dist/server/index.js --prod` on a single port with `client/build`
+present.
 
 ### Database backups
 Supabase's free tier has limited point-in-time recovery. Enable scheduled backups
@@ -167,27 +184,38 @@ Supabase's free tier has limited point-in-time recovery. Enable scheduled backup
 accumulates. Test a restore at least once.
 
 ## Health & degraded mode
-`GET /health` probes the database with a 2s timeout:
-`{"status":"ok","db":"up"}` or `{"status":"degraded","db":"down"}`.
-Use it for uptime checks and load-balancer health probes. Transient DB drops do
-not kill the process (retried connect, async error containment); the site stays
-on the last-good catalog until the DB recovers.
+- `GET /health/live` — liveness only, no database probe:
+  `{"status":"ok","service":"boma"}`. Use this for uptime monitors and platform
+  liveness checks.
+- `GET /health` — readiness, probes the database with a 2s timeout:
+  `{"status":"ok","db":"up"}` (200) or `{"status":"degraded","db":"down"}` (503).
+  Use it for load-balancer readiness and alerting.
+
+Transient DB drops do not kill the process (retried connect, async error
+containment); the site stays on the last-good catalog until the DB recovers.
 
 ## Known operational caveats
-- Supabase session pooler from some networks intermittently drops TLS handshakes.
-  The app absorbs these (retry + degraded mode). If drops are frequent, check the
-  network route or open a Supabase support ticket; port `6543` cannot be used by
-  Prisma from this setup.
-- In-memory auth rate limiting is per-process — run a single instance or move
-  `express-rate-limit` to a shared store before scaling horizontally.
+- Supabase's pooler from some networks intermittently drops TLS handshakes
+  (`P1001`, `P2028`, `/health` timeouts). The app absorbs these (retry + degraded
+  mode). If drops are frequent, check the network route or open a Supabase
+  support ticket. Use the session pooler (5432) locally and the transaction
+  pooler (6543, `pgbouncer=true&connection_limit=1`) on Vercel.
+- In-memory auth rate limiting is per-process — on Vercel each function instance
+  has its own counter. Database account lockout remains the durable control.
 - The React dev server on `:3000` proxies nothing; dev expects the API on `:4000`
-  and uses cross-origin calls with `CLIENT_URL`-style open CORS in development only.
+  and uses cross-origin calls. In production `CLIENT_URL` must list the exact
+  client origin(s).
+- The local server loads `.env` automatically; Vercel uses platform environment
+  variables. Never commit `.env` or bake secrets into `REACT_APP_*` variables.
 
 ## Verification
-- `npx tsc --noEmit` — server type-check (must pass).
+- `npx tsc --noEmit` / `npm run typecheck` — server type-check (must pass).
 - `node server/test-core-features.js` — regression suite (CRUD, duplicate 409,
   stale-version 409, sync, reports, lockout) against a running server.
 - `npm run build --prefix client` — production client compile.
+- `npm run build:server` — production server compile to `dist/`.
+- `npm run check:payments` — M-Pesa variables, Daraja OAuth and callback host.
+- `npm run check:go-live` — full pre-launch configuration/data audit.
 - `cdp-*.js` — headless-Chrome checks (need Chrome with `--remote-debugging-port=9222`).
 - CI: `.github/workflows/ci.yml` runs install, Prisma validate + generate, server
   type-check and the client production build on every push/PR.

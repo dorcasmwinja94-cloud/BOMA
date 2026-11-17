@@ -4,17 +4,22 @@
   "description": "Online Reservation Management System (Boma)",
   "scripts": {
     "db:migrate": "prisma migrate dev --name init",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:status": "prisma migrate status",
     "db:seed": "ts-node server/seed.ts",
     "db:generate": "prisma generate",
+    "postinstall": "prisma generate",
     "server": "ts-node-dev --respawn --transpile-only server/index.ts",
     "client": "npm start --prefix client",
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "build:client": "npm run build --prefix client",
-    "build": "npm run build:client",
+    "build:server": "tsc -p tsconfig.json",
+    "build": "npm run build:client && npm run build:server",
     "start": "ts-node --transpile-only server/index.ts --prod",
-    "start:prod": "npm start",
+    "start:prod": "npm run build:server && node dist/server/index.js --prod",
     "typecheck": "tsc --noEmit",
-    "check:payments": "ts-node --transpile-only server/scripts/checkPayments.ts"
+    "check:payments": "ts-node --transpile-only server/scripts/checkPayments.ts",
+    "check:go-live": "ts-node --transpile-only server/scripts/checkGoLive.ts"
   },
   "engines": {
     "node": ">=18"

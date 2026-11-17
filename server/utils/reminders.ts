@@ -9,7 +9,7 @@
 // reminder is recorded in the AuditLog so a guest never receives the same stage
 // twice — even across server restarts. None of this ever throws: a delivery
 // failure must not affect reservations.
-import { prisma, dbState } from "./prisma";
+import { prisma } from "./prisma";
 import { sendMail, reminderEmail } from "./mailer";
 import { sendSms } from "./africastalking";
 import { logAudit } from "../middleware/auth";
@@ -93,33 +93,42 @@ async function deliverReminder(reservationId: string, stage: "48H" | "SAME_DAY")
   return true;
 }
 
+let sweeping = false;
+
 export async function runReminderSweep(now = new Date()): Promise<{ sent: number; skipped?: string }> {
-  if (!dbState.ready) return { sent: 0, skipped: "database-down" };
-  const today = nairobiToday(now);
-  const tomorrow = addDays(today, 1);
+  // A cron trigger can overlap with the in-process scheduler (or a retry) when
+  // delivery is slow. Never let two sweeps email/text the same guests at once.
+  if (sweeping) return { sent: 0, skipped: "already-running" };
+  sweeping = true;
+  try {
+    const today = nairobiToday(now);
+    const tomorrow = addDays(today, 1);
 
-  // Stage 1: check-in tomorrow → 24–48h ahead.
-  const upcoming = await prisma.reservation.findMany({
-    where: { status: "CONFIRMED", checkInDate: new Date(`${tomorrow}T00:00:00.000Z`) },
-    select: { id: true },
-  });
-  let sent = 0;
-  for (const { id } of upcoming) {
-    if (await alreadySent(id, STAGE_48H)) continue;
-    if (await deliverReminder(id, "48H")) sent++;
+    // Stage 1: check-in tomorrow → 24–48h ahead.
+    const upcoming = await prisma.reservation.findMany({
+      where: { status: "CONFIRMED", checkInDate: new Date(`${tomorrow}T00:00:00.000Z`) },
+      select: { id: true },
+    });
+    let sent = 0;
+    for (const { id } of upcoming) {
+      if (await alreadySent(id, STAGE_48H)) continue;
+      if (await deliverReminder(id, "48H")) sent++;
+    }
+
+    // Stage 2: check-in today → same-day ping.
+    const sameDay = await prisma.reservation.findMany({
+      where: { status: "CONFIRMED", checkInDate: new Date(`${today}T00:00:00.000Z`) },
+      select: { id: true },
+    });
+    for (const { id } of sameDay) {
+      if (await alreadySent(id, STAGE_SAME_DAY)) continue;
+      if (await deliverReminder(id, "SAME_DAY")) sent++;
+    }
+
+    return { sent };
+  } finally {
+    sweeping = false;
   }
-
-  // Stage 2: check-in today → same-day ping.
-  const sameDay = await prisma.reservation.findMany({
-    where: { status: "CONFIRMED", checkInDate: new Date(`${today}T00:00:00.000Z`) },
-    select: { id: true },
-  });
-  for (const { id } of sameDay) {
-    if (await alreadySent(id, STAGE_SAME_DAY)) continue;
-    if (await deliverReminder(id, "SAME_DAY")) sent++;
-  }
-
-  return { sent };
 }
 
 let timer: NodeJS.Timeout | null = null;
