@@ -86,21 +86,27 @@ export async function completePayment(
   });
 
   if (result.recorded) {
-    await logAudit(
-      null,
-      "MPESA_PAYMENT_COMPLETE",
-      "Payment",
-      payment.reservationId,
-      JSON.stringify({
-        receipt,
-        amount: finalAmount,
-        source,
-        confirmed: result.confirmed,
-        reservationStatus: result.reservationStatus,
-      }),
-      "",
-      `boma-${source}`
-    );
+    try {
+      await logAudit(
+        null,
+        "MPESA_PAYMENT_COMPLETE",
+        "Payment",
+        payment.reservationId,
+        JSON.stringify({
+          receipt,
+          amount: finalAmount,
+          source,
+          confirmed: result.confirmed,
+          reservationStatus: result.reservationStatus,
+        }),
+        "",
+        `boma-${source}`
+      );
+    } catch (e) {
+      // The payment is already committed. A failed audit write must not turn a
+      // successful payment into a callback error or suppress the receipt.
+      console.error("[mpesa] payment completed but audit log failed:", (e as Error)?.message || e);
+    }
     if (result.confirmed) {
       console.log(`[mpesa] payment COMPLETED for reservation ${payment.reservationId} receipt ${receipt} (${source}) — reservation confirmed.`);
     } else if (result.reservationStatus === "CANCELLED" || result.reservationStatus === "FLAGGED_DUPLICATE") {
@@ -198,15 +204,19 @@ export async function failPayment(
     data: { status: "FAILED" },
   });
   if (failed.count === 0) return false;
-  await logAudit(
-    null,
-    "MPESA_PAYMENT_FAILED",
-    "Payment",
-    payment.reservationId,
-    JSON.stringify({ resultCode, resultDesc, source }),
-    "",
-    `boma-${source}`
-  );
+  try {
+    await logAudit(
+      null,
+      "MPESA_PAYMENT_FAILED",
+      "Payment",
+      payment.reservationId,
+      JSON.stringify({ resultCode, resultDesc, source }),
+      "",
+      `boma-${source}`
+    );
+  } catch (e) {
+    console.error("[mpesa] failed payment but audit log failed:", (e as Error)?.message || e);
+  }
   console.warn(`[mpesa] payment FAILED for reservation ${payment.reservationId}: ${resultCode} ${resultDesc} (${source})`);
   return true;
 }
