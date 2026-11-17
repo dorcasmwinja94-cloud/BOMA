@@ -6,23 +6,24 @@ database.
 
 ## 1. Architecture
 
-Boma is deployed as **two Vercel projects** from this repository:
+Boma is deployed as **one Vercel project** from this repository:
 
-| Project | Root directory | Purpose | URL example |
+| Project | Root directory | Purpose | URL |
 | --- | --- | --- | --- |
-| `boma-api` | repository root | Express API, M-Pesa callbacks, cron endpoints | `https://boma-api.vercel.app` |
-| `boma-client` | `client` | React single-page app | `https://boma-client.vercel.app` |
+| `boma-reservations` | repository root | CRA static site **and** the Express API under `/api/*` | `https://boma-reservations.vercel.app` |
 
-Why two projects: the API needs to make 20-second Daraja calls, receive
-Safaricom's callback, and run scheduled jobs. The client is a static CRA build.
-Splitting them keeps the client on the CDN, gives the API its own function
-limits and logs, and avoids trying to serve an SPA and an Express app from one
-serverless entry point.
+Why one project: the SPA and the API ship and deploy together, every
+browser request (including the M-Pesa callback path) is same-origin so no
+CORS is needed for guests, and rollbacks revert both halves atomically.
+`vercel.json` builds the client (`npm --prefix client run build`), serves
+`client/build` from the CDN with a catch-all rewrite to `index.html`, and
+routes `/api/*` to the serverless function in `api/index.ts` (Express, from
+`server/app.ts`, same code as the long-running server minus Socket.IO and the
+in-process schedulers).
 
 The long-running local server (`server/index.ts`) still exists for development
-and single-host deployments. It keeps Socket.IO and in-process schedulers. The
-serverless entry (`api/index.ts`) exports the same Express app without either;
-scheduled work moves to `/api/cron/*`.
+and single-host deployments. It keeps Socket.IO and in-process schedulers.
+Scheduled work on Vercel moves to `/api/cron/*`.
 
 ## 2. External prerequisites
 
@@ -113,12 +114,13 @@ To confirm the deployed app is using the intended project, compare the project
 reference in `DATABASE_URL` (the `postgres.<ref>` username) with the reference in
 `SUPABASE_URL` / `REACT_APP_SUPABASE_URL` (`https://<ref>.supabase.co`).
 
-## 4. Deploy the API project
+## 4. Deploy the project
 
 1. Vercel → **Add New → Project** → import the repository.
 2. **Root Directory:** repository root. Framework preset: **Other**.
-3. Leave the build command from `vercel.json` (`npx prisma generate`). Do not
-   build the client here.
+3. The build command, output directory, function settings and rewrites all
+   come from `vercel.json` (client build → `client/build`, `/api/*` →
+   `api/index.ts`). Do not override them.
 4. Add the environment variables below for **Production** (and Preview if you
    use preview deployments).
 
@@ -126,13 +128,14 @@ reference in `DATABASE_URL` (the `postgres.<ref>` username) with the reference i
 | --- | --- | --- |
 | `DATABASE_URL` | yes | Supabase transaction pooler URL above |
 | `JWT_SECRET` | yes | 32+ random chars; generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"` |
-| `CLIENT_URL` | yes | `https://boma-client.vercel.app`; comma-separated values allowed for previews |
+| `CLIENT_URL` | yes | `https://boma-reservations.vercel.app`; comma-separated values allowed for previews |
 | `CRON_SECRET` | yes | 16+ random chars; protects `/api/cron/*` |
+| `REACT_APP_API_BASE` | yes | `/` — bakes same-origin API URLs into the client build (set on production **and** preview) |
 | `MPESA_CONSUMER_KEY` | for payments | all five M-Pesa values or none |
 | `MPESA_CONSUMER_SECRET` | for payments | |
 | `MPESA_SHORTCODE` | for payments | `174379` in sandbox |
 | `MPESA_PASSKEY` | for payments | sandbox passkey from Daraja |
-| `MPESA_CALLBACK_URL` | for payments | `https://<api-project>/api/payments/mpesa/callback` |
+| `MPESA_CALLBACK_URL` | for payments | `https://boma-reservations.vercel.app/api/payments/mpesa/callback` |
 | `MPESA_ENVIRONMENT` | recommended | `sandbox` until Go Live, then `production` |
 | `MPESA_TRANSACTION_TYPE` | optional | `CustomerPayBillOnline` (default) or `CustomerBuyGoodsOnline` |
 | `MPESA_DEPOSIT_PERCENT` | optional | `100` (default) or e.g. `30` for a deposit |
@@ -151,10 +154,10 @@ Do not set `PORT`. Do not set `NODE_ENV` manually on Vercel; the platform sets
 6. Verify:
 
 ```bash
-curl https://<api-project>/health/live
+curl https://boma-reservations.vercel.app/health/live
 # {"status":"ok","service":"boma"}
 
-curl https://<api-project>/health
+curl https://boma-reservations.vercel.app/health
 # {"status":"ok","db":"up"}  (503 + {"status":"degraded","db":"down"} if not)
 ```
 
@@ -162,31 +165,40 @@ curl https://<api-project>/health
 for uptime monitoring. `/health` is readiness and returns HTTP 503 when the
 database is unavailable.
 
-### 4.1 Function duration
+### 4.1 Function duration and region
 
 `vercel.json` sets `maxDuration: 120` for the API. Daraja calls are bounded at
 10s (OAuth/query) and 20s (STK push), so normal requests finish far sooner. The
 larger ceiling covers a payment-reconciliation cron sweep over several pending
 checkouts. Hobby currently allows up to 300s.
 
-## 5. Deploy the client project
+`vercel.json` also pins `regions: ["sfo1"]` (nearest Vercel region to the
+Supabase `us-west-1` pooler). Region selection is honored only on plans that
+support it; if the runtime logs still report another region (e.g. `cpt1`), the
+round trip to the database dominates request latency and moving the database
+closer, or upgrading the plan, is the fix — not client-side changes.
 
-1. Vercel → **Add New → Project** → same repository.
-2. **Root Directory:** `client`. Framework preset: **Create React App**.
-3. Environment variable for Production:
+## 5. The client is part of the same project — no second deploy
 
-| Variable | Value |
-| --- | --- |
-| `REACT_APP_API_BASE` | `https://<api-project>` — origin only, **no trailing slash and no `/api`** |
+The merged project builds the CRA client inside the same pipeline
+(`npm --prefix client run build`) and serves `client/build` from Vercel's CDN.
+Everything the browser loads is static; only `/api/*` hits the function.
 
-4. Deploy. `client/vercel.json` builds `npm run build` and serves `build/`.
-5. Open the client URL, sign in with a test account, and confirm the browser's
-   network calls go to the API origin. If they go to the client origin, the
-   variable was missing at build time; redeploy after adding it.
+`REACT_APP_API_BASE=/` (production and preview) bakes **same-origin** API URLs
+into the bundle (`/api/...`), so there is nothing to point at another origin.
+If you ever split the client out again, set `REACT_APP_API_BASE` to the API
+origin (no trailing slash, no `/api`) and redeploy — `REACT_APP_*` values are
+baked at build time, so adding them after the fact does not help.
 
-CORS on the API allows exactly the origins listed in `CLIENT_URL`. A request
-from an unlisted origin is blocked by the browser; server-to-server callers and
-Safaricom callbacks do not send an `Origin` header and are unaffected.
+Same-origin means guests need no CORS exception. `CLIENT_URL` is still required
+(email links and the socket allowlist use it) — set it to
+`https://boma-reservations.vercel.app`.
+
+After deploy, open the URL, sign in and confirm the browser's network calls go
+to the same origin (`/api/...`). If a stale, per-deployment URL
+(`boma-reservations-<hash>-njeri.vercel.app`) is bookmarked instead of the
+production alias, its build may predate current env values; always share the
+`boma-reservations.vercel.app` alias.
 
 ## 6. Scheduled jobs (reminders and payment recovery)
 
@@ -195,8 +207,8 @@ recovery. Use an external scheduler:
 
 | Job | URL | Frequency | Why |
 | --- | --- | --- | --- |
-| Payment recovery | `https://<api-project>/api/cron/payments` | every minute | queries pending STK checkouts and completes real payments |
-| Guest reminders | `https://<api-project>/api/cron/reminders` | every 15 minutes | 48-hour and same-day reminders |
+| Payment recovery | `https://boma-reservations.vercel.app/api/cron/payments` | every minute | queries pending STK checkouts and completes real payments |
+| Guest reminders | `https://boma-reservations.vercel.app/api/cron/reminders` | every 15 minutes | 48-hour and same-day reminders |
 
 Configure the request header:
 
@@ -209,7 +221,7 @@ Authorization: Bearer <CRON_SECRET>
 `CRON_SECRET` is unset or the job fails, and JSON summaries on success:
 
 ```bash
-curl -H "Authorization: Bearer $CRON_SECRET" https://<api-project>/api/cron/payments
+curl -H "Authorization: Bearer $CRON_SECRET" https://boma-reservations.vercel.app/api/cron/payments
 # {"ok":true,"job":"payments","checked":0,"completed":0,"failed":0,"pending":0}
 ```
 
@@ -249,7 +261,7 @@ evidence that production payments work.
 2. Replace the sandbox consumer key/secret, shortcode and passkey with the
    production values.
 3. Set `MPESA_ENVIRONMENT=production`.
-4. Keep `MPESA_CALLBACK_URL=https://<api-project>/api/payments/mpesa/callback`.
+4. Keep `MPESA_CALLBACK_URL=https://boma-reservations.vercel.app/api/payments/mpesa/callback`.
 5. Deploy and run `npm run check:go-live -- --skip-network` plus a real
    `npm run check:payments` against the production credentials.
 6. Take a small live payment to your own number and verify the receipt appears
@@ -294,7 +306,7 @@ It never writes data, sends messages or initiates a charge.
 - [ ] The public catalog loads and `X-Source` is not `fallback`.
 - [ ] A guest can register, book, and receive a confirmation code.
 - [ ] Staff can sign in, confirm a booking and view it in reports.
-- [ ] The client origin is the only browser origin allowed by CORS.
+- [ ] Browser network calls go to the same origin (`/api/...` on `boma-reservations.vercel.app`).
 - [ ] `GET /api/cron/payments` with the secret returns a JSON summary.
 - [ ] `GET /api/cron/payments` without the secret returns 401.
 - [ ] A sandbox STK payment reaches `COMPLETED` with a receipt (test handset).

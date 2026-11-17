@@ -146,7 +146,7 @@ PIN, and the property collects the balance at check-in.
 ## Production deployment
 
 The canonical runbook is **[docs/GO-LIVE.md](docs/GO-LIVE.md)**. It covers the
-two-project Vercel deployment (`boma-api` + `boma-client`), Supabase transaction
+two-part single-project Vercel deployment (site + API on `boma-reservations`), Supabase transaction
 pooler settings, baseline migrations, external cron, M-Pesa Go Live and the
 pre-launch data checks.
 
