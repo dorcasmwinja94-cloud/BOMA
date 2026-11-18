@@ -1,7 +1,7 @@
-// Vercel serverless entry point for the Boma API project.
+// Vercel serverless entry point.
 //
-// The local long-running server (server/index.ts) keeps Socket.IO and in-process
-// schedulers; this entry exports the same Express app without either. Scheduled
+// The local long-running server (server/index.ts) also starts in-process
+// schedulers; this entry exports the same Express app without them. Scheduled
 // work is triggered through the protected /api/cron/* routes instead.
 import type { IncomingMessage, ServerResponse } from "http";
 import { assertRuntimeConfig } from "../server/utils/runtimeConfig";

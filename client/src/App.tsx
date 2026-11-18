@@ -8,6 +8,12 @@ const API_BASE = (
   (process.env.NODE_ENV === "development" ? "http://localhost:4000" : "")
 ).replace(/\/+$/, "");
 
+// OAuth 2.0 Web Application client ID from Google Cloud Console (Identity
+// Services). When unset the Google button is hidden and the system behaves
+// exactly as before. The same value is used server-side as GOOGLE_CLIENT_ID
+// to verify the ID tokens.
+const GOOGLE_CLIENT_ID = String(process.env.REACT_APP_GOOGLE_CLIENT_ID || "").trim();
+
 class ApiError extends Error {
   status: number;
   data: any;
@@ -335,6 +341,7 @@ function PublicLayout({ title, subtitle, children }: { title?: string; subtitle?
   const links = [
     { to: "/catalog", label: "Catalog" },
     { to: "/book", label: "Book now" },
+    { to: "/find-booking", label: "Find booking" },
     user ? { to: portalForRole(user.role), label: "My account" } : { to: "/register", label: "Create account" },
   ];
 
@@ -395,6 +402,65 @@ function GoogleMark() {
       <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.1-4.1 5.6l6.2 5.2C37 41.2 44 36 44 24c0-1.3-.1-2.3-.4-3.5z" />
     </svg>
   );
+}
+
+// Official Google Identity Services button, wired to /api/auth/google.
+// Rendered only when REACT_APP_GOOGLE_CLIENT_ID is configured; otherwise the
+// caller renders its own fallback. Calls onToken with the server response
+// ({ token, user }) on success, or onError(message) otherwise.
+function GoogleSignInButton({ onError, onToken }: { onError: (message: string) => void; onToken: (data: any) => void }) {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const errorRef = React.useRef(onError);
+  const tokenRef = React.useRef(onToken);
+  errorRef.current = onError;
+  tokenRef.current = onToken;
+
+  React.useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      const google = (window as any).google;
+      if (google?.accounts?.id && ref.current) {
+        window.clearInterval(timer);
+        google.accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID,
+          callback: (response: any) => {
+            void (async () => {
+              try {
+                const res = await fetchWithTimeout(
+                  "/api/auth/google",
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ credential: response?.credential || "" }),
+                  },
+                  15000
+                );
+                const data = await readJson(res);
+                if (res.ok && data?.token) tokenRef.current(data);
+                else errorRef.current(data?.error || "Google sign-in failed. Please try again.");
+              } catch {
+                errorRef.current("Cannot reach the server. Please try again.");
+              }
+            })();
+          },
+        });
+        google.accounts.id.renderButton(ref.current, {
+          theme: "outline",
+          size: "large",
+          width: 380,
+          text: "continue_with",
+          shape: "rectangular",
+        });
+      } else if (++tries > 48) {
+        window.clearInterval(timer);
+        errorRef.current("Google sign-in failed to load. Check your connection and try again.");
+      }
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return <div ref={ref} style={{ display: "flex", justifyContent: "center", minHeight: 44 }} />;
 }
 
 type LoginToast = { id: number; type: "error" | "success"; message: string };
@@ -504,6 +570,12 @@ function Login() {
       setGoogleLoading(false);
       pushToast("error", "Google sign-in is not configured for this system. Please use your Boma email and password.");
     }, 1400);
+  }
+
+  function handleGoogleToken(data: any) {
+    localStorage.setItem("token", data.token);
+    localStorage.setItem("user", JSON.stringify(data.user));
+    navigate(portalForRole(data.user.role), { replace: true });
   }
 
   function openPolicy(name: string) {
@@ -751,10 +823,14 @@ function Login() {
 
             <div className="Boma-divider" aria-hidden="true"><span>or</span></div>
 
-            <button type="button" className="Boma-secondary" onClick={handleGoogle} disabled={googleLoading || disabled}>
-              <GoogleMark />
-              {googleLoading ? "Redirecting to Google..." : "Continue with Google"}
-            </button>
+            {GOOGLE_CLIENT_ID ? (
+              <GoogleSignInButton onError={(m) => pushToast("error", m)} onToken={handleGoogleToken} />
+            ) : (
+              <button type="button" className="Boma-secondary" onClick={handleGoogle} disabled={googleLoading || disabled}>
+                <GoogleMark />
+                {googleLoading ? "Redirecting to Google..." : "Continue with Google"}
+              </button>
+            )}
           </form>
 
           <p style={{ margin: 0, textAlign: "center", fontSize: 14, color: "#475569" }}>
@@ -1646,11 +1722,18 @@ function ClientPortal() {
   }
 
   async function cancelBooking(reservation: any) {
-    if (!window.confirm(`Cancel booking ${reservation.id}?`)) return;
+    const hoursBefore = reservation?.checkInDate ? Math.floor((new Date(reservation.checkInDate).getTime() - Date.now()) / 3600000) : Infinity;
+    const within48 = Number.isFinite(hoursBefore) && hoursBefore < 48;
+    const msg = within48
+      ? `Cancel booking ${reservation.id}? This is within 48 hours of check-in — the first night or your deposit may be retained under the Boma cancellation policy. Continue?`
+      : `Cancel booking ${reservation.id}? Cancelling more than 48 hours before check-in is free of charge. Any refund is processed to your original M-Pesa number within 3–5 business days. Continue?`;
+    if (!window.confirm(msg)) return;
     setError(""); setNotice("");
     try {
-      await apiSend(`/api/reservations/${reservation.id}/cancel-self`, "POST");
-      setNotice(`Booking ${reservationRef(reservation)} cancelled.`);
+      const result = await apiSend(`/api/reservations/${reservation.id}/cancel-self`, "POST");
+      setNotice(result?.cancellationWithin48h
+        ? `Booking ${reservationRef(reservation)} cancelled — inside 48 hours of check-in. The reservations desk will review the refund within 3–5 business days.`
+        : `Booking ${reservationRef(reservation)} cancelled. Any eligible refund is processed to your original M-Pesa number within 3–5 business days.`);
       await load();
     } catch (err: any) {
       setError(err?.message || "Could not cancel the booking.");
@@ -1696,7 +1779,15 @@ function ClientPortal() {
                     {(() => {
                       const payments = r.payments || [];
                       const paid = payments.find((p: any) => p.status === "COMPLETED");
-                      if (paid) return <span className="cell-sub" title={paid.transactionId ? `M-Pesa receipt ${paid.transactionId}` : "Paid"}>Paid{paid.transactionId ? ` · ${paid.transactionId}` : ""}</span>;
+                      if (paid) {
+                        const paidSum = payments.filter((p: any) => p.status === "COMPLETED").reduce((s: number, p: any) => s + Number(p.amount || 0), 0);
+                        const total = Number(r.totalAmount || 0);
+                        const balance = Math.max(0, total - paidSum);
+                        if (balance > 0) {
+                          return <span className="cell-sub" title={paid.transactionId ? `M-Pesa receipt ${paid.transactionId}` : "Paid"}>Deposit KES {paidSum.toLocaleString()} · Balance KES {String(balance)} at check-in{paid.transactionId ? ` · ${paid.transactionId}` : ""}</span>;
+                        }
+                        return <span className="cell-sub" title={paid.transactionId ? `M-Pesa receipt ${paid.transactionId}` : "Paid"}>Paid in full{paid.transactionId ? ` · ${paid.transactionId}` : ""}</span>;
+                      }
                       const pending = payments.find((p: any) => p.status === "PENDING");
                       if (pending) return <span className="cell-sub">Pending…</span>;
                       if (r.status === "CANCELLED") return <span className="cell-sub">—</span>;
@@ -2106,11 +2197,17 @@ function RegisterPage() {
   const [error, setError] = React.useState("");
   const [notice, setNotice] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const navigate = useNavigate();
+  function handleGoogleToken(data: any) {
+    localStorage.setItem("token", data.token);
+    localStorage.setItem("user", JSON.stringify(data.user));
+    navigate(portalForRole(data.user.role), { replace: true });
+  }
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); setError(""); setNotice("");
     try {
       await apiSend("/api/public/register", "POST", form);
-      setNotice("Account created. You can now sign in.");
+      setNotice("Account created. A welcome message is on its way to your email. You can now sign in.");
       setForm({ fullName: "", email: "", password: "", phoneNumber: "" });
     } catch (err: any) { setError(err?.message || "Could not create the account."); }
     finally { setBusy(false); }
@@ -2126,6 +2223,16 @@ function RegisterPage() {
           <Field label="Password" required><input className="portal-input" type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} /></Field>
           <Field label="Phone number"><input className="portal-input" value={form.phoneNumber} onChange={e => setForm({ ...form, phoneNumber: e.target.value })} placeholder="+254..." /></Field>
           <button className="btn btn-primary" type="submit" disabled={busy}>{busy ? "Creating..." : "Create account"}</button>
+          {GOOGLE_CLIENT_ID && (
+            <>
+              <div aria-hidden="true" style={{ display: "flex", alignItems: "center", gap: 12, color: "#94A3B8", fontSize: 12, margin: "4px 0" }}>
+                <span style={{ flex: 1, height: 1, background: "#E2E8F0" }} />
+                or
+                <span style={{ flex: 1, height: 1, background: "#E2E8F0" }} />
+              </div>
+              <GoogleSignInButton onError={setError} onToken={handleGoogleToken} />
+            </>
+          )}
         </form>
         <p style={{ marginTop: 16, fontSize: 13, color: "#475569" }}>Already have an account? <Link to="/">Sign in</Link></p>
       </div>
@@ -2396,6 +2503,72 @@ function BookingPage() {
   );
 }
 
+function FindBookingPage() {
+  const [q, setQ] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const [rows, setRows] = React.useState<any[] | null>(null);
+
+  async function handleSearch(e: React.FormEvent) {
+    e.preventDefault();
+    setError(""); setRows(null);
+    const code = q.trim().toUpperCase();
+    if (!/^[A-Z0-9-]{4,24}$/.test(code)) { setError("Enter your confirmation code (e.g. Boma-AB12), exactly as it appears on your email or SMS."); return; }
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/public/confirmations/search?q=${encodeURIComponent(code)}`);
+      if (!res.ok) throw new Error("lookup failed");
+      const data = await res.json();
+      setRows(Array.isArray(data) ? data : []);
+    } catch {
+      setError("We couldn't look up that booking right now. Please try again, or contact the 24/7 reservations desk.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <PublicLayout title="Find your booking" subtitle="No sign-in needed — retrieve your reservation with your Boma-XXXX confirmation code.">
+      <form onSubmit={handleSearch} className="card" style={{ maxWidth: 560, padding: 20, display: "grid", gap: 14 }}>
+        {error && <Alert tone="error" onClose={() => setError("")}>{error}</Alert>}
+        <label htmlFor="find-booking-code" style={{ fontSize: 13, fontWeight: 650, color: "#334155" }}>Confirmation code</label>
+        <input id="find-booking-code" className="portal-input" value={q} onChange={e => setQ(e.target.value)} placeholder="e.g. Boma-AB12" autoCapitalize="characters" autoComplete="off" spellCheck={false} required />
+        <button className="btn btn-primary" type="submit" disabled={busy}>{busy ? "Searching…" : "Find booking"}</button>
+      </form>
+
+      {rows !== null && rows.length === 0 && (
+        <div className="card" style={{ maxWidth: 560, padding: 20, marginTop: 12, fontSize: 13.5, color: "#B45309" }}>
+          No booking was found for that code. Double-check the code from your email or SMS, or contact the 24/7 reservations desk and we will resend it.
+        </div>
+      )}
+
+      {rows !== null && rows.length > 0 && rows.map(r => (
+        <div key={r.confirmationCode} className="card" style={{ maxWidth: 560, padding: 20, marginTop: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", borderBottom: "1px solid #E2E8F0", paddingBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.08em", color: "#64748B" }}>Confirmation code</div>
+              <div className="code-ref" style={{ fontSize: 18, fontWeight: 800, color: "#0F172A" }}>{r.confirmationCode}</div>
+            </div>
+            <Badge value={r.status} />
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "8px 18px", fontSize: 13.5, color: "#334155", marginTop: 10 }}>
+            <span style={{ color: "#64748B" }}>Service</span><span>{r.serviceName}</span>
+            <span style={{ color: "#64748B" }}>Location</span><span>{r.location}</span>
+            <span style={{ color: "#64748B" }}>Dates</span><span>{new Date(r.checkInDate).toLocaleDateString()} → {new Date(r.checkOutDate).toLocaleDateString()}</span>
+            <span style={{ color: "#64748B" }}>Guests</span><span>{r.numberOfGuests}</span>
+            <span style={{ color: "#64748B" }}>Total</span><span>KES {Number(r.totalAmount || 0).toLocaleString()}</span>
+            <span style={{ color: "#64748B" }}>Paid</span><span>KES {Number(r.amountPaid || 0).toLocaleString()}</span>
+            <span style={{ color: "#64748B" }}>Balance at check-in</span><span>{Number(r.balanceDue || 0) > 0 ? `KES ${Number(r.balanceDue).toLocaleString()}` : "Nothing — paid in full"}</span>
+          </div>
+          <p style={{ margin: "12px 0 0", fontSize: 12.5, color: "#64748B" }}>Need to change or cancel? Sign in to your account, or call the reservations desk — free cancellation up to 48 hours before check-in.</p>
+        </div>
+      ))}
+
+      <p style={{ maxWidth: 560, marginTop: 12, fontSize: 12.5, color: "#64748B" }}>Questions before you book? The Boma reservations desk is available 24/7 — call or reply to your confirmation message and a real person will help.</p>
+    </PublicLayout>
+  );
+}
+
 export default function App() {
   useLocation();
   const user = readStoredUser();
@@ -2415,6 +2588,7 @@ export default function App() {
       <Route path="/reset-password" element={<PasswordResetPage />} />
       <Route path="/catalog" element={<ServiceCatalog />} />
       <Route path="/book" element={<BookingPage />} />
+      <Route path="/find-booking" element={<FindBookingPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

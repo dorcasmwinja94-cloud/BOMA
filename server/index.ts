@@ -1,6 +1,5 @@
 import "./utils/envBootstrap"; // must be first: populates process.env before other imports
 import http from "http";
-import { Server } from "socket.io";
 import { createApp } from "./app";
 import { prisma, dbState } from "./utils/prisma";
 import { startReminderScheduler } from "./utils/reminders";
@@ -11,19 +10,6 @@ import { assertRuntimeConfig, isProductionRuntime } from "./utils/runtimeConfig"
 const production = isProductionRuntime();
 const app = createApp({ serveClient: true });
 const server = http.createServer(app);
-
-const socketOrigins = String(process.env.CLIENT_URL || "")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
-const io = new Server(server, {
-  cors: { origin: socketOrigins.length ? socketOrigins : "*" },
-});
-
-io.on("connection", (socket) => {
-  console.log("Socket connected:", socket.id);
-  socket.join("manager");
-});
 
 let shuttingDown = false;
 
@@ -48,11 +34,6 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
       resolve();
     }, 3000).unref();
   });
-  try {
-    io.close();
-  } catch {
-    // Socket.IO may already be closed by server.close().
-  }
   try {
     await prisma.$disconnect();
   } catch {
@@ -145,7 +126,7 @@ async function start(): Promise<void> {
   });
   server.listen(port, () => {
     console.log(`Boma server running on port ${port}`);
-    // The split Vercel deployment uses /api/cron/*, not in-process timers.
+    // The Vercel deployment uses /api/cron/*, not in-process timers.
     if (!process.env.VERCEL) {
       startReminderScheduler();
       startPaymentReconciler();

@@ -128,6 +128,25 @@ export function reminderEmail(input: { guestName: string; code: string; serviceN
   return { subject: `Boma reminder — ${input.code} is ${input.when}`, html, text };
 }
 
+export function welcomeEmail(input: { name: string; email: string }) {
+  const html = shell(`
+    <h2 style="margin:0 0 12px">Welcome to Boma, ${escapeHtml(input.name)}!</h2>
+    <p style="margin:0 0 12px">Your Boma account is ready. Boma is the online home of Boma Reservations — browse and book stays, tours and transfers, manage your bookings, and receive confirmations and reminders right on this address.</p>
+    <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:12px;padding:16px;margin:16px 0">
+      <div style="font-size:12px;color:#475569;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Get started in two minutes</div>
+      <ol style="margin:0;padding-left:20px;font-size:14px;line-height:1.8;color:#0F172A">
+        <li>Explore the catalog and pick a stay, tour or transfer</li>
+        <li>Choose your dates — you will see the total before you pay</li>
+        <li>Confirm with M-Pesa; your booking is held in your name</li>
+      </ol>
+    </div>
+    <p style="margin:0 0 16px;font-size:14px;color:#334155">Free cancellation applies up to 48 hours before check-in. Late changes may forfeit the deposit — the details are always shown before you pay. Questions? Just reply to this email; the reservations desk reads it.</p>
+    <p style="margin:16px 0 0"><a href="${CLIENT_URL}/catalog" style="display:inline-block;background:#2563EB;color:#FFFFFF;padding:10px 18px;border-radius:8px;text-decoration:none">Explore stays, tours &amp; transfers</a></p>
+  `);
+  const text = `Boma Reservations - welcome to Boma, ${input.name}!\nYour account is ready. Browse and book stays, tours and transfers at ${CLIENT_URL}/catalog.\nFree cancellation up to 48 hours before check-in. Questions? Reply to this email.`;
+  return { subject: "Welcome to Boma Reservations", html, text };
+}
+
 export function passwordResetEmail(input: { name: string; token: string }) {
   const link = `${CLIENT_URL}/reset-password?token=${encodeURIComponent(input.token)}`;
   const html = shell(`

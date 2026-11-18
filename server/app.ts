@@ -8,8 +8,8 @@ import cronRouter from "./routes/cron";
 import { isProductionRuntime } from "./utils/runtimeConfig";
 
 export type CreateAppOptions = {
-  // The local server serves the compiled CRA build. The split Vercel API
-  // project does not: the client is deployed as its own project.
+  // The local long-running server serves the compiled CRA build. On Vercel the
+  // CDN serves the client and only /api/* reaches this app.
   serveClient?: boolean;
 };
 
@@ -28,9 +28,9 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
   app.disable("x-powered-by");
   if (production) app.set("trust proxy", 1);
 
-  // Same-origin production deployments need no CORS. Split deployments (client
-  // and API on different Vercel projects) set CLIENT_URL to the client origin;
-  // a comma-separated list also covers preview deployments.
+  // Same-origin production deployments need no CORS. CLIENT_URL is still the
+  // browser origin allowed to call the API; a comma-separated list also
+  // covers preview deployments and a future split into two projects.
   const origins = allowedOrigins();
   const originOption = origins.length
     ? (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
@@ -47,6 +47,8 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
     next();
   });
   // Bounded body size: the API never accepts file uploads, only small JSON
@@ -96,14 +98,14 @@ export function createApp(options: CreateAppOptions = {}): express.Express {
     const buildDir = path.join(process.cwd(), "client", "build");
     app.use(express.static(buildDir));
     app.get("*", (req, res, next) => {
-      if (req.path.startsWith("/api") || req.path.startsWith("/health") || req.path.startsWith("/socket.io")) {
+      if (req.path.startsWith("/api") || req.path.startsWith("/health")) {
         return next();
       }
       res.sendFile(path.join(buildDir, "index.html"));
     });
   } else {
     app.get("/", (_req, res) => {
-      res.json({ service: "boma-api", status: "ok", health: "/health/live" });
+      res.json({ service: "boma", status: "ok", health: "/health/live" });
     });
     // Every other unknown path is an API 404, not Express's HTML page.
     app.use((req: Request, res: Response) => {

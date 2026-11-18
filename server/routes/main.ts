@@ -7,7 +7,9 @@ import { getJwtSecret } from "../utils/runtimeConfig";
 import jwt from "jsonwebtoken";
 const { v4: uuidv4 } = require("uuid") as { v4: () => string };
 import { sendMail, confirmationEmail, passwordResetEmail, mailerMode } from "../utils/mailer";
+import { sendWelcomeMessage } from "../utils/welcome";
 import { sendSms } from "../utils/africastalking";
+import { googleConfigured, verifyGoogleIdToken } from "../utils/googleAuth";
 import { mpesaConfigured, stkPush, normalizeKenyanPhone, MPESA_ENV, MPESA_SANDBOX } from "../utils/mpesa";
 import { completePayment, failPayment, reconcilePayment, PAYMENT_PENDING_PREFIX } from "../utils/paymentRecovery";
 
@@ -160,15 +162,20 @@ async function attemptStk(reservation: any, phoneInput: string) {
   const totalAmount = Math.max(1, Math.round(Number(reservation.totalAmount) || 0));
   const depositPercent = Math.min(100, Math.max(1, Math.round(Number(process.env.MPESA_DEPOSIT_PERCENT || 100)) || 100));
   const amount = Math.max(1, Math.round((totalAmount * depositPercent) / 100));
+  const balance = Math.max(0, totalAmount - amount);
+  const paymentKind = depositPercent < 100 ? "DEPOSIT" : "FULL_PAYMENT";
   try {
-    const stk = await stkPush({ phone, amount, accountReference: reservation.id.slice(0, 12), description: `Boma ${reservation.id.slice(0, 6)}` });
+    const stk = await stkPush({ phone, amount, accountReference: reservation.id.slice(0, 12), description: depositPercent < 100 ? "Boma Deposit" : "Boma Full" });
     const pendingRef = `MPESA-PENDING-${stk.checkoutRequestId}`;
     await prisma.payment.upsert({
       where: { reservationId: reservation.id },
       create: { reservationId: reservation.id, method: "MPESA", transactionId: pendingRef, amount, currency: "KES", status: "PENDING", attemptedAt: new Date() },
       update: { method: "MPESA", transactionId: pendingRef, amount, status: "PENDING", paidAt: null, attemptedAt: new Date() },
     });
-    return { ok: true as const, amount, phone, checkoutRequestId: stk.checkoutRequestId, body: { status: "PENDING", message: stk.customerMessage, amount, totalAmount, depositPercent, phone, sandbox: MPESA_SANDBOX } };
+    const payMessage = depositPercent < 100
+      ? `Deposit of KES ${amount.toLocaleString()} requested (${depositPercent}% of KES ${totalAmount.toLocaleString()}). The remaining KES ${balance.toLocaleString()} is payable at check-in. Enter your M-Pesa PIN.`
+      : `Full payment of KES ${amount.toLocaleString()} requested. Enter your M-Pesa PIN.`;
+    return { ok: true as const, amount, phone, checkoutRequestId: stk.checkoutRequestId, body: { status: "PENDING", message: payMessage, amount, totalAmount, depositPercent, balance, paymentKind, phone, sandbox: MPESA_SANDBOX } };
   } catch (e) {
     console.error("[mpesa] STK push error:", (e as Error)?.message || e);
     return { ok: false as const, status: 502 as const, body: { error: `M-Pesa could not be reached right now. Please try again or pay at the front desk. (${(e as Error)?.message?.slice(0, 200) || "upstream error"})` } };
@@ -266,6 +273,17 @@ const loginLimiter = rateLimit({
   message: { error: "Too many login attempts from this IP. Please try again later." },
 });
 
+// Public (unauthenticated) endpoints: booking creation, M-Pesa initiation,
+// registration, password reset and booking lookup. 30 requests/minute per IP
+// keeps scripted abuse away without affecting a guest completing a booking.
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many requests from this IP. Please wait a minute and try again." },
+});
+
 // -------- AUTH --------
 router.post("/auth/login", loginLimiter, async (req: Request, res: Response) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
@@ -333,6 +351,67 @@ router.post("/auth/login", loginLimiter, async (req: Request, res: Response) => 
   await logAudit(user.id, "LOGIN", "User", user.id, null, req.ip || "", req.headers["user-agent"] || "");
   const token = jwt.sign({ id: user.id, email: user.email, role: user.role, fullName: user.fullName }, getJwtSecret(), { expiresIn: "8h" });
   res.json({ token, user: { id: user.id, fullName: user.fullName, email: user.email, role: user.role } });
+});
+
+// -------- GOOGLE SIGN-IN (Google Identity Services) --------
+// Verifies a GIS ID token. An existing account with the same Google-verified
+// email is signed in as-is; otherwise a CLIENT account is created (with an
+// unguessable password hash — the password path stays unused until the
+// guest sets one via the reset flow) and welcomed like a form registration.
+router.post("/auth/google", loginLimiter, async (req: Request, res: Response) => {
+  if (!googleConfigured()) {
+    return res.status(503).json({ error: "Google sign-in is not configured for this system." });
+  }
+  let profile;
+  try {
+    profile = await verifyGoogleIdToken(String(req.body?.credential || ""));
+  } catch (e) {
+    console.warn("[google] token verification failed:", (e as Error)?.message || e);
+    return res.status(401).json({ error: "Google sign-in failed. Please try again." });
+  }
+
+  const email = profile.email;
+  const ip = req.ip || "";
+  const ua = req.headers["user-agent"] || "";
+  let user = await prisma.user.findUnique({ where: { email } });
+  let isNew = false;
+
+  if (user) {
+    if (!user.isActive) {
+      return res.status(401).json({ error: "This account has been disabled. Contact the reservations desk." });
+    }
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: 0, lockedUntil: null },
+    });
+    await logAudit(user.id, "LOGIN_GOOGLE", "User", user.id, null, ip, ua);
+  } else {
+    isNew = true;
+    user = await prisma.user.create({
+      data: {
+        fullName: profile.name,
+        email,
+        passwordHash: hashPassword(`${uuidv4()}${uuidv4()}`), // unguessable — password login stays unused until the guest sets one
+        role: "CLIENT",
+        isActive: true,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+    await prisma.client.create({
+      data: { userId: user.id, fullName: profile.name, email, phoneNumber: "", isGuest: true },
+    });
+    await logAudit(null, "CREATE", "Client", user.id, JSON.stringify({ fullName: profile.name, email, via: "google" }), ip, ua);
+    await logAudit(user.id, "LOGIN_GOOGLE", "User", user.id, null, ip, ua);
+    try {
+      await sendWelcomeMessage({ name: profile.name, email, phoneNumber: "" });
+    } catch (e) {
+      console.warn("[welcome] send failed:", (e as Error)?.message || e);
+    }
+  }
+
+  const token = jwt.sign({ id: user.id, email: user.email, role: user.role, fullName: user.fullName }, getJwtSecret(), { expiresIn: "8h" });
+  res.json({ token, isNew, user: { id: user.id, fullName: user.fullName, email: user.email, role: user.role } });
 });
 
 router.get("/auth/me", authenticate, (req: AuthReq, res: Response) => {
@@ -668,6 +747,36 @@ router.get("/confirmations/search", authenticate, async (req: AuthReq, res: Resp
   res.json(confirmations);
 });
 
+// Public (unauthenticated) booking lookup: a guest who lost their email/SMS can
+// retrieve their booking by confirmation code (Boma-XXXX). Code-only match so
+// the endpoint cannot be used to enumerate client names/emails.
+router.get("/public/confirmations/search", publicLimiter, async (req: Request, res: Response) => {
+  const q = String(req.query.q || "").trim().toUpperCase();
+  if (!/^[A-Z0-9-]{4,24}$/.test(q)) return res.json([]);
+  const byCode = await prisma.confirmation.findUnique({
+    where: { confirmationCode: q },
+    include: { reservation: { include: { client: true, service: true, payments: true } } },
+  });
+  if (!byCode) return res.json([]);
+  const r = byCode.reservation;
+  const paid = (r.payments || []).filter(p => p.status === "COMPLETED").reduce((s, p) => s + Number(p.amount || 0), 0);
+  res.json([{
+    confirmationCode: byCode.confirmationCode,
+    deliveryStatus: byCode.deliveryStatus,
+    status: r.status,
+    serviceName: r.service?.name || "",
+    serviceType: r.service?.serviceType || "",
+    location: r.service?.location || "",
+    checkInDate: r.checkInDate,
+    checkOutDate: r.checkOutDate,
+    numberOfGuests: r.numberOfGuests,
+    totalAmount: r.totalAmount,
+    amountPaid: paid,
+    balanceDue: Math.max(0, Number(r.totalAmount || 0) - paid),
+    createdAt: r.createdAt,
+  }]);
+});
+
 router.post("/confirmations/:id/resend", authenticate, async (req: AuthReq, res: Response) => {
   const confirmation = await prisma.confirmation.findUnique({
     where: { id: req.params.id },
@@ -874,7 +983,7 @@ router.post("/payments/mpesa/initiate", authenticate, async (req: AuthReq, res: 
 
 // Public initiation for guests who booked without an account. The booking's
 // confirmation code is the bearer secret alongside the unguessable reservation UUID.
-router.post("/public/payments/mpesa/initiate", async (req: Request, res: Response) => {
+router.post("/public/payments/mpesa/initiate", publicLimiter, async (req: Request, res: Response) => {
   const reservationId = String(req.body?.reservationId || "");
   const confirmationCode = String(req.body?.confirmationCode || "").trim();
   if (!reservationId || !confirmationCode) return res.status(400).json({ error: "reservationId and confirmationCode are required." });
@@ -890,7 +999,7 @@ router.post("/public/payments/mpesa/initiate", async (req: Request, res: Respons
 });
 
 // Public payment status poll â€” same bearer pair as public initiation.
-router.get("/public/payments/status/:reservationId", async (req: Request, res: Response) => {
+router.get("/public/payments/status/:reservationId", publicLimiter, async (req: Request, res: Response) => {
   const confirmationCode = String(req.query.code || "").trim();
   const reservation = await prisma.reservation.findUnique({ where: { id: req.params.reservationId }, include: { confirmation: true } });
   if (!reservation || reservation.confirmation?.confirmationCode !== confirmationCode) return res.status(404).json({ error: "Reservation not found." });
@@ -1011,13 +1120,19 @@ router.post("/reservations/:id/cancel-self", authenticate, async (req: AuthReq, 
     if (!client || existing.clientId !== client.id) return res.status(403).json({ error: "Forbidden" });
   }
   if (existing.status === "CANCELLED") return res.status(400).json({ error: "This reservation is already cancelled." });
+  // Cancellation policy: free up to 48h before check-in; inside 48h the first
+  // night or the deposit may be retained. We classify but never block — the
+  // refund disposition stays with the reservations desk (case by case), per
+  // the published booking & cancellation policy.
+  const hoursBeforeCheckIn = Math.floor((new Date(existing.checkInDate).getTime() - Date.now()) / 3600000);
+  const cancellationWithin48h = hoursBeforeCheckIn >= 0 && hoursBeforeCheckIn < 48;
   const updated = await prisma.reservation.update({
     where: { id },
     data: { status: "CANCELLED", version: { increment: 1 } },
     include: { client: true, service: true, confirmation: true, syncLogs: true, payments: true },
   });
-  await logAudit(req.user!.id, "CANCEL_SELF", "Reservation", id, null, req.ip || "", req.headers["user-agent"] || "");
-  res.json(updated);
+  await logAudit(req.user!.id, "CANCEL_SELF", "Reservation", id, JSON.stringify({ cancellationWithin48h, hoursBeforeCheckIn }), req.ip || "", req.headers["user-agent"] || "");
+  res.json({ ...updated, cancellationWithin48h, hoursBeforeCheckIn });
 });
 
 // -------- PUBLIC SERVICE CATALOG --------
@@ -1053,7 +1168,7 @@ router.get("/public/services", async (req: Request, res: Response) => {
 });
 
 // -------- PUBLIC SELF-REGISTRATION --------
-router.post("/public/register", async (req: Request, res: Response) => {
+router.post("/public/register", publicLimiter, async (req: Request, res: Response) => {
   const { fullName, email, password, phoneNumber, address } = req.body || {};
   if (!fullName || !email || !password) {
     return res.status(400).json({ error: "Full name, email and password are required." });
@@ -1075,11 +1190,16 @@ router.post("/public/register", async (req: Request, res: Response) => {
     },
   });
   await logAudit(null, "CREATE", "Client", user.id, JSON.stringify({ fullName, email: normalizedEmail }), req.ip || "", req.headers["user-agent"] || "");
-  res.status(201).json({ message: "Account created successfully. You can now sign in." });
+  try {
+    await sendWelcomeMessage({ name: fullName, email: normalizedEmail, phoneNumber: String(phoneNumber || "") });
+  } catch (e) {
+    console.warn("[welcome] send failed:", (e as Error)?.message || e);
+  }
+  res.status(201).json({ message: "Account created. A welcome message is on its way to your email. You can now sign in." });
 });
 
 // -------- PUBLIC PASSWORD RESET --------
-router.post("/public/password-reset-request", async (req: Request, res: Response) => {
+router.post("/public/password-reset-request", publicLimiter, async (req: Request, res: Response) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: "Email is required." });
   const normalizedEmail = String(email).trim().toLowerCase();
@@ -1106,7 +1226,7 @@ router.post("/public/password-reset-request", async (req: Request, res: Response
   res.json(response);
 });
 
-router.post("/public/password-reset", async (req: Request, res: Response) => {
+router.post("/public/password-reset", publicLimiter, async (req: Request, res: Response) => {
   const { token, password } = req.body || {};
   if (!token || !password) return res.status(400).json({ error: "Reset token and new password are required." });
   if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
@@ -1125,7 +1245,7 @@ router.post("/public/password-reset", async (req: Request, res: Response) => {
 });
 
 // -------- PUBLIC BOOKING PATH (guest or logged-in) --------
-router.post("/public/reservations", async (req: Request, res: Response) => {
+router.post("/public/reservations", publicLimiter, async (req: Request, res: Response) => {
   const { serviceId, checkInDate, checkOutDate, numberOfGuests, notes, fullName, email, phoneNumber } = req.body || {};
   const ci = parseDate(checkInDate);
   const co = parseDate(checkOutDate);

@@ -1,0 +1,30 @@
+# Backstop scheduler for the production API.
+#
+# Hobby-plan Vercel cron runs at most once per day, so the minute-level
+# payment reconciler and the 15-minute reminder sweep are driven by this
+# workflow. GitHub Actions enforces a minimum schedule interval of 5 minutes
+# and can fire late during load spikes, which is acceptable for a backstop —
+# the local PM2 server runs both sweeps in-process, and any guest payment
+# status poll also nudges reconciliation inline.
+#
+# Required repository secret (Settings → Secrets and variables → Actions):
+#   CRON_SECRET — same value as the Vercel environment variable.
+name: production-cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Payment reconciliation sweep
+        run: |
+          curl --fail-with-body -sS -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            https://boma-reservations.vercel.app/api/cron/payments
+      - name: Reminder sweep (idempotent — alreadySent() dedupes)
+        run: |
+          curl --fail-with-body -sS -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            https://boma-reservations.vercel.app/api/cron/reminders
